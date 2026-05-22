@@ -1,40 +1,47 @@
-# Standard library imports
+# moovegui.py – PyQt6 main window
 import os
+import sys
 import configparser
 import shutil
-import tkinter as tk
-from tkinter import ttk
-from pathlib import Path
-import logging
-import matplotlib as mpl
-import ctypes
-import matplotlib.pyplot as plt
 import platform
+import ctypes
+import logging
+import threading
+import signal
+import time
+from pathlib import Path
 
-# Third-party library imports
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+# Import torch early to avoid DLL/OpenMP conflicts on Windows when
+# scientific/GUI stacks (e.g., matplotlib) load runtime DLLs first.
+import torch
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.widgets import RectangleSelector
-from RangeSlider.RangeSlider import RangeSliderV
-from PIL import Image, ImageTk
+from PIL import Image
 
-# Custom module imports
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QComboBox, QPushButton, QCheckBox, QRadioButton, QButtonGroup,
+    QMessageBox, QSizePolicy
+)
+from PyQt6.QtCore import Qt, QRect, QTimer
+from PyQt6.QtGui import QIcon, QPixmap, QPalette
+
+from moove.qt_helpers import QRangeSliderV, RadioAdapter, set_combo_items, invoke_in_main_thread, show_info
 from moove.utils import (
     get_display_data, get_directories, read_batch, get_file_data_by_index,
     save_seg_class_recfile, plot_data, select_event, edit_syllable,
     handle_keypress, zoom, unzoom, swipe_left, swipe_right, handle_playback,
     handle_delete, handle_crop, open_resegment_window, update,
     open_cluster_window, open_training_window, open_relabel_window, find_batch_files,
-    create_batch_file
+    create_batch_file, unzoom_small
 )
-
-# Model imports
 from moove.models.ConvMLP import ConvMLP
 from moove.models.CNN import CNN
+from moove.app_state import AppState
 
-# Global config imports
-from moove.app_state import AppState  # App state management
-
-# Disable all default matplotlib key bindings to avoid conflicts with labeling
 for key in list(mpl.rcParams):
     if key.startswith('keymap.'):
         mpl.rcParams[key] = []
@@ -42,8 +49,9 @@ for key in list(mpl.rcParams):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create / read config file
-# Allow custom config directory via environment variable, fallback to ~/.moove
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
 moove_config_dir = os.environ.get('MOOVE_CONFIG_DIR')
 if moove_config_dir:
     home_config_dir = os.path.expanduser(moove_config_dir)
@@ -58,678 +66,639 @@ if not os.path.exists(config_file_path):
     shutil.copy(example_config_file_path, config_file_path)
     logger.info(f"Created config file at: {config_file_path}")
 
-config = configparser.ConfigParser()
-config.read(config_file_path)
-global_dir = config.get("GENERAL", "global_dir")
-global_dir = os.path.expanduser(global_dir)
+_config = configparser.ConfigParser()
+_config.read(config_file_path)
+_global_dir = os.path.expanduser(_config.get("GENERAL", "global_dir"))
 
-# Create subfolders needed for moove in global_dir
-subdirs = ["rec_data", "trained_models", "training_data", "cluster_data", "playbacks"]
-for subdir in subdirs:
-    subdir_path = os.path.join(global_dir, subdir)
-    os.makedirs(subdir_path, exist_ok=True)
+for subdir in ["rec_data", "trained_models", "training_data", "cluster_data", "playbacks"]:
+    os.makedirs(os.path.join(_global_dir, subdir), exist_ok=True)
 
-# Load example file if missing
 package_example_data = os.path.join(os.path.dirname(__file__), "example_data", "bird_x")
-target_bird_x_dir = os.path.join(global_dir, "rec_data", "bird_x")
+target_bird_x_dir = os.path.join(_global_dir, "rec_data", "bird_x")
 if not os.path.exists(target_bird_x_dir):
     shutil.copytree(package_example_data, target_bird_x_dir)
 
-# Load example white noise playback if missing
 package_example_data_WN = os.path.join(os.path.dirname(__file__), "example_data", "white_noise")
-target_WN_dir = os.path.join(global_dir, "playbacks", "white_noise")
+target_WN_dir = os.path.join(_global_dir, "playbacks", "white_noise")
 if not os.path.exists(target_WN_dir):
     shutil.copytree(package_example_data_WN, target_WN_dir)
 
-# Create the main window
-root = tk.Tk()
-root.title("MooveGUI")
 
-# Set window icon
-try:
-    # Get the absolute path to the moove package directory
-    package_dir = os.path.dirname(os.path.abspath(__file__))
+def _resolve_icon_path():
+    """Return preferred icon path, platform-aware.
 
-    # Always use logo_128.png in full resolution for sharpest quality
-    icon_path = os.path.join(package_dir, "templates", "logo_128_white_bg_small.png")
-    icon_path = os.path.abspath(icon_path)
+    macOS: .icns or high-res PNG (Retina).
+    Windows: .ico first.
+    Fallback: any available PNG.
+    """
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    assets = os.path.normpath(os.path.join(pkg_dir, "..", "assets"))
 
-    if os.name == 'nt':
-        # Windows: set AppUserModelID for correct taskbar icon
-        myappid = 'tkinter.python.test'
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-
-    # Load icon (fallback logic)
-    if os.path.exists(icon_path):
-        # Load the 128x128 PNG in full resolution - no resizing for best quality
-        icon_image = Image.open(icon_path)
+    if sys.platform == "darwin":
+        candidates = [
+            os.path.join(assets, "logo_128_white_bg.icns"),
+            os.path.join(assets, "logo_white_bg.png"),
+            os.path.join(assets, "logo_128_white_bg.png"),
+            os.path.join(assets, "logo.png"),
+        ]
     else:
-        # Fallback to original logo.png if 128 version not found
-        fallback_path = os.path.join(package_dir, "templates", "logo.png")
-        fallback_path = os.path.abspath(fallback_path)
-        if os.path.exists(fallback_path):
-            icon_image = Image.open(fallback_path)
+        candidates = [
+            os.path.join(assets, "logo_128_white_bg_scaled.ico"),
+            os.path.join(assets, "logo_128_white_bg.png"),
+            os.path.join(assets, "logo.png"),
+        ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+class MooveMainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MooveGUI")
+        self._set_icon()
+
+        # App state
+        self.app_state = AppState(_global_dir)
+        self.app_state.load_state()
+        self._apply_config()
+
+        # Derive colours from palette
+        bg = self.palette().color(QPalette.ColorRole.Window)
+        brightness = (bg.red() * 299 + bg.green() * 587 + bg.blue() * 114) / 1000
+        self.app_state.text_color = "#ffffff" if brightness < 128 else "#000000"
+        self.app_state.bg_color = bg.name()
+
+        # Central widget
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(2)
+
+        self._build_top_bar(main_layout)
+        self._build_plot_area(main_layout)
+        self._build_button_bar(main_layout)
+        self._build_radio_bar(main_layout)
+        self._connect_canvas_events()
+
+        plot_data(self.app_state)
+        self.app_state.init_flag = True
+
+    def restore_last_window_geometry(self):
+        """Restore window position/size from app state if it is still on any screen."""
+        geom = self.app_state.window_geometry
+        if not isinstance(geom, dict):
+            return False
+
+        try:
+            x = int(geom.get("x"))
+            y = int(geom.get("y"))
+            width = int(geom.get("width"))
+            height = int(geom.get("height"))
+        except (TypeError, ValueError):
+            return False
+
+        if width <= 0 or height <= 0:
+            return False
+
+        target = QRect(x, y, width, height)
+        for screen in QApplication.screens():
+            if screen.availableGeometry().intersects(target):
+                self.setGeometry(target)
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Config
+    # ------------------------------------------------------------------
+    def _apply_config(self):
+        s = self.app_state
+        s.config["global_dir"] = _global_dir
+        s.config["rec_data"] = os.path.join(_global_dir, "rec_data")
+        s.config["lower_spec_plot"] = int(_config.get('GUI', 'lower_spec_plot'))
+        s.config["upper_spec_plot"] = int(_config.get('GUI', 'upper_spec_plot'))
+        s.config["vmin_range_slider"] = float(_config.get('GUI', 'vmin_range_slider'))
+        s.config["vmax_range_slider"] = float(_config.get('GUI', 'vmax_range_slider'))
+        s.config["spec_nperseg"] = int(_config.get('GUI', 'spec_nperseg'))
+        s.config["spec_noverlap"] = int(_config.get('GUI', 'spec_noverlap'))
+        s.config["spec_nfft"] = int(_config.get('GUI', 'spec_nfft'))
+        s.config["performance"] = str(_config.get('GUI', 'performance'))
+
+    # ------------------------------------------------------------------
+    # Icon
+    # ------------------------------------------------------------------
+    def _set_icon(self):
+        try:
+            icon_path = _resolve_icon_path()
+            if icon_path:
+                icon = QIcon(icon_path)
+                self.setWindowIcon(icon)
+                QApplication.instance().setWindowIcon(icon)
+            if sys.platform == 'win32':
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('moove.gui')
+        except Exception as e:
+            logger.warning(f"Could not set window icon: {e}")
+
+    def _apply_native_windows_icon(self):
+        """Apply taskbar icon via WinAPI as fallback when Qt icon is ignored."""
+        if sys.platform != "win32":
+            return
+
+        icon_path = _resolve_icon_path()
+        if not icon_path:
+            return
+
+        try:
+            hwnd = int(self.winId())
+            user32 = ctypes.windll.user32
+
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            LR_DEFAULTSIZE = 0x0040
+            WM_SETICON = 0x0080
+            ICON_SMALL = 0
+            ICON_BIG = 1
+
+            hicon = user32.LoadImageW(None, icon_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+            if hicon:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+        except Exception as e:
+            logger.warning(f"Could not apply native Windows icon: {e}")
+
+    # ------------------------------------------------------------------
+    # Top bar (comboboxes + checkboxes)
+    # ------------------------------------------------------------------
+    def _build_top_bar(self, parent_layout):
+        s = self.app_state
+        bar = QHBoxLayout()
+
+        # Determine restored path parts
+        path_parts = None
+        if s.data_dir:
+            selected_day_path = s.data_dir
+            path_parts = Path(selected_day_path).parts
+            if path_parts[-4] != Path(s.config['rec_data']).name:
+                s.data_dir = None
+                path_parts = None
+
+        # Bird
+        birds = sorted(get_directories(s.config['rec_data']))
+        self.bird_combo = QComboBox()
+        self.bird_combo.setMinimumWidth(120)
+        self.bird_combo.addItems(birds)
+        s.bird_combobox = self.bird_combo
+        if path_parts and path_parts[-3] in birds:
+            self.bird_combo.setCurrentText(path_parts[-3])
+        self.bird_combo.currentTextChanged.connect(self._on_bird_changed)
+        bar.addWidget(self.bird_combo)
+
+        # Experiment
+        self.experiment_combo = QComboBox()
+        self.experiment_combo.setMinimumWidth(180)
+        s.experiment_combobox = self.experiment_combo
+        self._populate_experiments()
+        if path_parts:
+            exps = [self.experiment_combo.itemText(i) for i in range(self.experiment_combo.count())]
+            if path_parts[-2] in exps:
+                self.experiment_combo.setCurrentText(path_parts[-2])
+        self.experiment_combo.currentTextChanged.connect(self._on_experiment_changed)
+        bar.addWidget(self.experiment_combo)
+
+        # Day
+        self.day_combo = QComboBox()
+        self.day_combo.setMinimumWidth(120)
+        s.day_combobox = self.day_combo
+        self._populate_days()
+        if path_parts:
+            days_list = [self.day_combo.itemText(i) for i in range(self.day_combo.count())]
+            if path_parts[-1] in days_list:
+                self.day_combo.setCurrentText(path_parts[-1])
+            else:
+                self._set_data_dir_from_combos()
         else:
-            icon_image = None
+            self._set_data_dir_from_combos()
+        self.day_combo.currentTextChanged.connect(lambda: self._on_day_changed())
+        bar.addWidget(self.day_combo)
 
-    if icon_image:
-        icon_photo = ImageTk.PhotoImage(icon_image)
-        root.iconphoto(True, icon_photo)
-        logger.debug(f"Window icon set successfully ({icon_path if os.path.exists(icon_path) else fallback_path})")
-    else:
-        logger.warning("No icon files found in templates directory")
-except Exception as e:
-    logger.warning(f"Could not set window icon: {e}")
+        # Load batch & song files
+        selected_day_path = s.data_dir or os.path.join(
+            s.config['rec_data'], self.bird_combo.currentText(),
+            self.experiment_combo.currentText(), self.day_combo.currentText())
+        s.data_dir = selected_day_path
 
-# Initialize app state
-app_state = AppState(global_dir)
-app_state.load_state()
-
-app_state.config["global_dir"] = global_dir
-app_state.config["rec_data"] = os.path.join(global_dir, "rec_data")
-app_state.config["lower_spec_plot"] = int(config.get('GUI', 'lower_spec_plot'))
-app_state.config["upper_spec_plot"] = int(config.get('GUI', 'upper_spec_plot'))
-app_state.config["vmin_range_slider"] = float(config.get('GUI', 'vmin_range_slider'))
-app_state.config["vmax_range_slider"] = float(config.get('GUI', 'vmax_range_slider'))
-app_state.config["spec_nperseg"] = int(config.get('GUI', 'spec_nperseg'))
-app_state.config["spec_noverlap"] = int(config.get('GUI', 'spec_noverlap'))
-app_state.config["spec_nfft"] = int(config.get('GUI', 'spec_nfft'))
-app_state.config["performance"] = str(config.get('GUI', 'performance'))
-
-
-# Get background color for Tkinter
-tkinter_bg_color = root.cget("bg")
-
-# Function to determine text color based on background brightness
-def get_text_color(bg_color):
-    """Get text color based on background brightness."""
-    rgb = root.winfo_rgb(bg_color)
-    r, g, b = [x // 256 for x in rgb]
-    brightness = (r * 299 + g * 587 + b * 114) / 1000
-    return "#ffffff" if brightness < 128 else "#000000"
-
-# Save text color and convert background color to hex
-app_state.text_color = get_text_color(tkinter_bg_color)
-app_state.bg_color = "#%02x%02x%02x" % tuple(c // 256 for c in root.winfo_rgb(tkinter_bg_color))
-
-
-# Experiment and day combobox update functions
-def update_experiment_combobox():
-    """Update the experiment combobox based on selected bird."""
-    selected_bird = bird_combobox.get()
-    experiments = sorted(get_directories(os.path.join(app_state.config['rec_data'], selected_bird)))
-    experiment_combobox['values'] = experiments
-    experiment_combobox.current(0)
-    update_day_combobox()
-
-
-def update_day_combobox():
-    """Update the day combobox based on selected bird and experiment."""
-    selected_bird = bird_combobox.get()
-    selected_experiment = experiment_combobox.get()
-    days = sorted(get_directories(os.path.join(app_state.config['rec_data'], selected_bird, selected_experiment)))
-    day_combobox['values'] = days
-    day_combobox.current(0)
-    update_selected_day(app_state)
-
-
-def update_selected_day(app_state):
-    """Update the data based on selected day."""
-    if app_state.init_flag:
-        selected_day = day_combobox.get()
-        selected_day_path = os.path.join(app_state.config['rec_data'], bird_combobox.get(), experiment_combobox.get(),
-                                         selected_day)
-        app_state.logger.debug(f"Selected day path: {selected_day_path}")
-        app_state.data_dir = selected_day_path
-        app_state.current_file_index = 0
-
-        # Update batch files dropdown
         batch_files = find_batch_files(selected_day_path)
-        app_state.batch_combobox['values'] = batch_files
-        app_state.batch_combobox.set("batch.txt")  # Reset to default batch
-        if not batch_files:
-            create_batch_file(selected_day_path)
-        app_state.current_batch_file = "batch.txt"
-
-        # Load song files from default batch
-        app_state.song_files = read_batch(selected_day_path, app_state.current_batch_file)
-        app_state.combobox.set(app_state.song_files[app_state.current_file_index])
-        app_state.combobox['values'] = app_state.song_files
-        plot_data(app_state)
-        app_state.logger.debug("Data updated for the selected day")
-
-
-# Redraw spectrogram functions
-def update_spectrogram_from_slider(app_state):
-    """Update the spectrogram based on slider values with a delay."""
-    if app_state.update_timer is not None:
-        root.after_cancel(app_state.update_timer)
-    app_state.update_timer = root.after(100, lambda: redraw_spectrogram(app_state))
-
-
-def redraw_spectrogram(app_state):
-    """Redraw the spectrogram with the current slider values."""
-    app_state.update_timer = None
-    vmin = vBottom.get()
-    vmax = vTop.get()
-    app_state.current_vmin = vmin
-    app_state.current_vmax = vmax
-    app_state.redraw_spectrogram(vmin, vmax)
-
-
-# Combobox selection handling
-def combobox_selection(event):
-    """Handle combobox selection."""
-    selected_file = app_state.combobox.get()
-    app_state.current_file_index = app_state.song_files.index(selected_file)
-    plot_data(app_state)
-
-
-def on_select(eclick, erelease):
-    """Handle the selection event for the spectrogram axes."""
-    
-    # prevents zoom when the difference between mouse click and release is too small
-    # to imply a zoom
-    # only zooming in > 5 ms possible
-    time_diff_ms = abs(eclick.xdata - erelease.xdata) * 1000
-    if time_diff_ms < 5:
-        return
-    
-    def set_axes_limits(axis, eclick, erelease):
-        """Set x and y limits for the selected axis based on click and release coordinates."""
-        if eclick.ydata > erelease.ydata:
-            eclick.ydata, erelease.ydata = erelease.ydata, eclick.ydata
-        if eclick.xdata > erelease.xdata:
-            eclick.xdata, erelease.xdata = erelease.xdata, eclick.xdata
-        axis.set_xlim(eclick.xdata, erelease.xdata)
-
-    if eclick.inaxes == ax1:
-        set_axes_limits(ax1, eclick, erelease)
-    elif eclick.inaxes == ax3:
-        set_axes_limits(ax3, eclick, erelease)
-
-    canvas.draw()
-
-
-# Hover and checkbox toggle events
-def on_hover(event):
-    """Change cursor to cross when hovering over canvas."""
-    canvas.get_tk_widget().configure(cursor="tcross")
-
-
-def on_leave(event):
-    """Reset cursor when leaving the canvas."""
-    canvas.get_tk_widget().configure(cursor="")
-
-
-def on_checkbox_toggle():
-    """Handle checkbox toggle for saving recfile."""
-    file_path = get_file_data_by_index(app_state.data_dir, app_state.song_files, app_state.current_file_index, app_state)
-    current_file = os.path.splitext(file_path["file_path"])[0]+".rec"
-    segmented = app_state.segmented_var.get()
-    classified = app_state.classified_var.get()
-    save_seg_class_recfile(current_file, segmented, classified)
-
-
-def on_edit_type_selected(value):
-    """Handle the selection of edit type."""
-    app_state.edit_type = value
-
-    if value == "New Segment":
-        canvas.get_tk_widget().configure(cursor="tcross")
-    elif value == "Move Segment":
-        canvas.get_tk_widget().configure(cursor="tcross")
-    elif value == "None":
-        canvas.get_tk_widget().configure(cursor="tcross")
-        if app_state.selected_syllable_index is not None and app_state.ax2.texts:
-            app_state.ax2.texts[app_state.selected_syllable_index].set_color('black')
-            app_state.selected_syllable_index = None
-            canvas.draw_idle()
-    else:
-        canvas.get_tk_widget().configure(cursor="")
-
-    app_state.logger.debug("Edit type selected: %s", app_state.edit_type)
-
-
-def update_batch_selection(app_state):
-    """Update the song files list based on the selected batch file."""
-    selected_batch = app_state.batch_combobox.get()
-    app_state.current_batch_file = selected_batch
-    app_state.song_files = read_batch(app_state.data_dir, selected_batch)
-    app_state.current_file_index = 0 if app_state.song_files else None
-
-    # Update the file combobox
-    app_state.combobox['values'] = app_state.song_files
-    if app_state.song_files:
-        app_state.combobox.set(app_state.song_files[app_state.current_file_index])
-        plot_data(app_state)
-    else:
-        app_state.combobox.set("")
-        # Clear the canvas when no files are available
-        for ax in [app_state.ax1, app_state.ax2, app_state.ax3]:
-            ax.clear()
-        app_state.canvas.draw()
-
-    app_state.logger.debug(f"Updated batch selection to {selected_batch} with {len(app_state.song_files)} files")
-
-
-# Create comboboxes
-top_frame = tk.Frame(root)
-top_frame.pack(side=tk.TOP, fill=tk.X)
-
-if app_state.data_dir:
-    selected_day_path = app_state.data_dir
-    path_parts = Path(selected_day_path).parts
-    # Check if config datadir has changed
-    if path_parts[-4] != Path(app_state.config['rec_data']).name:
-        app_state.data_dir = None
-
-# Bird combobox
-birds = sorted(get_directories(app_state.config['rec_data']))
-bird_combobox = ttk.Combobox(top_frame, values=birds)
-bird_combobox.pack(side=tk.LEFT)
-bird_combobox.bind("<<ComboboxSelected>>", lambda _: update_experiment_combobox())
-if app_state.data_dir:
-    bird_name = path_parts[-3]
-    # checks if bird folder is still there
-    if bird_name in birds:
-        bird_combobox.set(bird_name)
-    else:
-        # defaults to first bird if folder deleted
-        bird_combobox.current(0)
-        logger.info(f"'{bird_name}' not found in birds list — defaulting to first bird")
-else:
-    # default for first opening
-    bird_combobox.current(0)
-
-# Experiment combobox
-experiments = sorted(get_directories(os.path.join(app_state.config['rec_data'], bird_combobox.get())))
-experiment_combobox = ttk.Combobox(top_frame, values=experiments, width=30)
-experiment_combobox.pack(side=tk.LEFT)
-experiment_combobox.bind("<<ComboboxSelected>>", lambda _: update_day_combobox())
-if app_state.data_dir:
-    experiment_name = path_parts[-2]
-    # checks if experiment folder is still there
-    if experiment_name in experiments:
-        experiment_combobox.set(experiment_name)
-    else:
-        # defaults to first experiment if folder deleted
-        experiment_combobox.current(0)
-        logger.info(f"'{experiment_name}' not found in birds list — defaulting to first experiment")
-else:
-    # default for first opening
-    experiment_combobox.current(0)
-
-# Day combobox
-days = sorted(
-    get_directories(os.path.join(app_state.config['rec_data'], bird_combobox.get(), experiment_combobox.get())))
-day_combobox = ttk.Combobox(top_frame, values=days)
-day_combobox.pack(side=tk.LEFT)
-day_combobox.bind("<<ComboboxSelected>>", lambda _: update_selected_day(app_state))
-if app_state.data_dir:
-    day_name = path_parts[-1]
-    if day_name in days:
-        # checks if day folder still exists
-        day_combobox.set(day_name)
-    else:
-        day_combobox.current(0)
-        selected_day_path = os.path.join(app_state.config['rec_data'], bird_combobox.get(), experiment_combobox.get(),
-                                         day_combobox.get())
-        app_state.data_dir = selected_day_path
-        logger.info(f"'{day_name}' not found in birds list — defaulting to first day")
-    # print(path_parts) # debugging message to check existing folder structure
-else:
-    day_combobox.current(0)
-    selected_day_path = os.path.join(app_state.config['rec_data'], bird_combobox.get(), experiment_combobox.get(),
-                                     day_combobox.get())
-    app_state.data_dir = selected_day_path
-
-
-batch_files = find_batch_files(selected_day_path)
-# load song files based on previous or default batch file
-if app_state.current_batch_file in batch_files:
-    app_state.song_files = read_batch(selected_day_path, app_state.current_batch_file)
-else:
-    # load default batch if previous batch not found
-    app_state.current_batch_file = "batch.txt"
-    app_state.song_files = read_batch(selected_day_path)
-
-if app_state.current_file_index is None:
-    # start with file 0 if no file index is saved
-    app_state.current_file_index = 0
-
-current_file_name = get_file_data_by_index(app_state.data_dir, app_state.song_files, app_state.current_file_index, app_state)[
-    'file_name']
-full_path = os.path.join(app_state.data_dir, current_file_name)
-
-# update batch files with every GUI start
-valid_files = sorted(
-    f for f in os.listdir(app_state.data_dir) 
-    if f.endswith('.wav') or f.endswith('.cbin')
-)
-for batch in batch_files:
-    batch_path = os.path.join(app_state.data_dir, batch)
-    if batch == 'batch.txt':
-        with open(batch_path, 'w') as f:
-            f.write('\n'.join(valid_files))
-    else:
-        with open(batch_path, 'r') as f:
-            keep_files = f.read().splitlines()
-        filtered_files = [f for f in keep_files if f in valid_files]
-        # only keep existing files in batches
-        with open(batch_path, 'w') as f:
-            f.write('\n'.join(filtered_files))
-app_state.logger.info(f"Batch files have been updated.")
-
-app_state.song_files = read_batch(app_state.data_dir, app_state.current_batch_file)
-
-file_path = get_file_data_by_index(app_state.data_dir, app_state.song_files, app_state.current_file_index, app_state)
-
-app_state.display_dict = get_display_data(file_path, app_state.config)
-
-fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(9, 5.5), gridspec_kw={'height_ratios': [6, 1, 6]}, sharex=True) # added
-
-# Dropdown menu for file selection
-file_combobox = ttk.Combobox(top_frame, values=app_state.song_files, width=38)
-app_state.combobox = file_combobox
-app_state.combobox.pack(side=tk.LEFT)
-app_state.combobox.bind('<<ComboboxSelected>>', combobox_selection)
-app_state.combobox.set(app_state.song_files[app_state.current_file_index])
-
-# Dropdown for batch file selection
-batch_combobox = ttk.Combobox(top_frame, values=batch_files, width=30)
-app_state.batch_combobox = batch_combobox
-app_state.batch_combobox.pack(side=tk.LEFT)
-app_state.batch_combobox.bind('<<ComboboxSelected>>', lambda event: update_batch_selection(app_state))
-app_state.batch_combobox.set(app_state.current_batch_file)  # open previously used batch file
-
-# Create checkboxes for "Segmented" and "Classified"
-classified_var = tk.StringVar(value="0")
-segmented_var = tk.StringVar(value="0")
-
-classified_checkbox = ttk.Checkbutton(top_frame, text="Classified  ", variable=app_state.classified_var, onvalue="1",
-                                      offvalue="0")  # space next to text is for padding
-segmented_checkbox = ttk.Checkbutton(top_frame, text="Segmented  ", variable=app_state.segmented_var, onvalue="1",
-                                     offvalue="0")  # space next to text is for padding
-
-classified_checkbox.pack(side=tk.RIGHT)
-segmented_checkbox.pack(side=tk.RIGHT, padx=(5, 0))
-
-app_state.segmented_var.trace_add("write", lambda *args: on_checkbox_toggle())
-app_state.classified_var.trace_add("write", lambda *args: on_checkbox_toggle())
-
-axes = fig.get_axes()
-ax1 = axes[0]
-ax2 = axes[1]
-ax3 = axes[2]
-# Frame for canvas and slider
-plot_frame = tk.Frame(root)
-plot_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-# Canvas for the figure
-canvas = FigureCanvasTkAgg(fig, master=plot_frame)
-app_state.set_axes(ax1, ax2, ax3)
-app_state.set_canvas(canvas)
-app_state.display_dict = get_display_data(file_path, app_state.config)
-# ax3 background saved for marker highlighting
-app_state.ax3_background = app_state.canvas.copy_from_bbox(app_state.ax3.bbox)
-
-canvas_widget = canvas.get_tk_widget()
-canvas_widget.grid(row=0, column=0, sticky="nsew")  # Position canvas in the grid
-
-# Configure grid
-plot_frame.grid_rowconfigure(0, weight=1)
-plot_frame.grid_columnconfigure(0, weight=1)
-plot_frame.grid_columnconfigure(1, weight=0)
-
-# ensures that previous slider settings are within the min and max range of the slider
-if (app_state.current_vmin is not None and app_state.current_vmax is not None) and (
-        app_state.current_vmin > app_state.config['vmin_range_slider'] and app_state.current_vmax < app_state.config[
-    'vmax_range_slider']):
-    vBottom = tk.DoubleVar(value=app_state.current_vmin)
-    vTop = tk.DoubleVar(value=app_state.current_vmax)
-else:
-    distance = app_state.config['vmax_range_slider'] - app_state.config['vmin_range_slider']
-    distance = distance / 4
-    vBottom = tk.DoubleVar(value=app_state.config['vmin_range_slider'] + distance)
-    vTop = tk.DoubleVar(value=app_state.config['vmax_range_slider'] - distance)
-
-vBottom.trace_add("write", lambda name, index, mode: update_spectrogram_from_slider(app_state))
-vTop.trace_add("write", lambda name, index, mode: update_spectrogram_from_slider(app_state))
-
-# Create and position the slider
-vSlider = RangeSliderV(plot_frame, [vBottom, vTop], min_val=app_state.config['vmin_range_slider'],
-                       max_val=app_state.config['vmax_range_slider'],
-                       font_family="Arial", font_size=10, padY=20, Width=128, bar_radius=9,
-                       bgColor=app_state.bg_color, font_color=app_state.text_color)
-vSlider.grid(row=0, column=1, sticky="ns")
-
-plot_frame.grid_columnconfigure(1, weight=0)  # Make column 1 (for slider) non-adjustable
-
-# Rectangle selectors
-rect_selector_ax1 = RectangleSelector(ax1, on_select, useblit=True,
-                                      button=[1],  # Left mouse button
-                                      minspanx=30, minspany=30,
-                                      spancoords='pixels',
-                                      interactive=False,
-                                      state_modifier_keys={
-                                      "rotate": "",     # deactivate r binding
-                                      },
-)
-
-rect_selector_ax3 = RectangleSelector(ax3, on_select, useblit=True,
-                                      button=[1],  # Left mouse button
-                                      minspanx=30, minspany=30,
-                                      spancoords='pixels',
-                                      interactive=False,
-                                      state_modifier_keys={
-                                      "rotate": "",     # deactivate r binding
-                                      },
-)
-
-# Update button
-center_frame = tk.Frame(root)
-button_frame = tk.Frame(root)
-
-# Platform-specific styling for refresh button to fix macOS display issue
-if platform.system() == 'Darwin':  # macOS
-    refresh_text = "↻"  # Alternative refresh symbol that renders better on macOS
-else:  # Windows and other platforms
-    refresh_text = "⟳"  # Original symbol works fine on Windows
-
-btn_update = tk.Button(button_frame, text=refresh_text, command=lambda: update(app_state))
-btn_update.pack(side=tk.LEFT, padx=(0, 20))
-
-# Navigation buttons
-btn_previous = tk.Button(button_frame, text="Previous",
-                         command=lambda: (app_state.change_file(-1), plot_data(app_state)))
-btn_previous.pack(side=tk.LEFT)
-btn_next = tk.Button(button_frame, text="Next", command=lambda: (app_state.change_file(1), plot_data(app_state)))
-btn_next.pack(side=tk.LEFT)
-button_frame.pack(padx=5, pady=5)
-center_frame.pack(fill=tk.X)
-
-# Swiping buttons
-btn_swipe_left = tk.Button(button_frame, text="  <  ", command=lambda: swipe_left(app_state))
-btn_swipe_left.pack(side=tk.LEFT)
-btn_swipe_right = tk.Button(button_frame, text="  >  ", command=lambda: swipe_right(app_state))
-btn_swipe_right.pack(side=tk.LEFT)
-
-# Zoom and Unzoom buttons
-btn_zoom = tk.Button(button_frame, text="Zoom", command=lambda: zoom(app_state))
-btn_zoom.pack(side=tk.LEFT)
-btn_unzoom = tk.Button(button_frame, text="Unzoom", command=lambda: unzoom(app_state))
-btn_unzoom.pack(side=tk.LEFT)
-
-# Crop button
-btn_crop = tk.Button(button_frame, text="Crop", command=lambda: handle_crop(app_state))
-btn_crop.pack(side=tk.LEFT)
-# Delete button
-btn_delete = tk.Button(button_frame, text="Delete", command=lambda: handle_delete(app_state))
-btn_delete.pack(side=tk.LEFT)
-# Play button
-btn_play = tk.Button(button_frame, text="Play", command=lambda: handle_playback(app_state))
-btn_play.pack(side=tk.LEFT)
-# Resegment button
-btn_resegment = tk.Button(button_frame, text="Resegment",
-                          command=lambda: open_resegment_window(root, app_state, bird_combobox, experiment_combobox,
-                                                                day_combobox))
-btn_resegment.pack(side=tk.LEFT)
-# Relabel button
-btn_relabel = tk.Button(button_frame, text="Relabel",
-                        command=lambda: open_relabel_window(root, app_state, bird_combobox, experiment_combobox,
-                                                            day_combobox))
-btn_relabel.pack(side=tk.LEFT)
-# Create Training Dataset button
-btn_training = tk.Button(button_frame, text="Training",
-                         command=lambda: open_training_window(root, app_state, bird_combobox, experiment_combobox,
-                                                              day_combobox))
-btn_training.pack(side=tk.LEFT)
-# Cluster button
-btn_cluster = tk.Button(button_frame, text="Cluster",
-                        command=lambda: open_cluster_window(root, app_state, bird_combobox, experiment_combobox,
-                                                            day_combobox))
-btn_cluster.pack(side=tk.LEFT)
-
-# Global state for syllable selection
-selected_syllable_index = None
-edit_mode = False
-
-# Edit mode selection
-radio_frame = tk.Frame(root)
-
-v = tk.StringVar(root, "1")
-options = {"None": "1",
-           "New Segment": "2",
-           "Delete Segment": "3",
-           "Move Segment": "4",
-           "Label Interactive": "5"}
-
-# Add radio buttons to frame
-for txt, val in options.items():
-    tk.Radiobutton(radio_frame, text=txt, variable=v, value=val,
-                   command=lambda txt=txt: on_edit_type_selected(txt)).pack(side=tk.LEFT)
-
-# Center the frame in the root widget
-radio_frame.pack(side=tk.TOP, anchor='center')
-
-def reset_edit_type_selection():
-    """Reset the edit type radio button selection to 'None'"""
-    v.set("1")  # "1" corresponds to "None"
-
-# Connect the GUI reset function to app_state
-app_state.reset_edit_type_gui = reset_edit_type_selection
-
-# Add events to canvas
-canvas.mpl_connect('key_press_event', lambda event: handle_keypress(event, app_state, v))
-canvas.mpl_connect('button_press_event', lambda event: select_event(event, app_state))
-canvas.mpl_connect('key_press_event', lambda event: edit_syllable(event, app_state))
-
-plot_data(app_state)
-app_state.init_flag = True
-
-
-def force_exit_after_timeout():
-    """Force exit the application after a timeout"""
-    import time
-    import os
-    import signal
-    
-    time.sleep(3.0)  # Wait 3 seconds
-    
-    try:
-        logger.warning("Timeout reached - force killing application")
-        os.kill(os.getpid(), signal.SIGKILL)
-    except:
-        try:
-            os._exit(1)
-        except:
-            pass
-
-
-def on_closing():
-    """Handle application closing with graceful thread shutdown"""
-    try:
-        # Check for active threads
-        with app_state.thread_lock:
-            active_count = len(app_state.active_threads)
-        
-        if active_count > 0:
-            # Ask user if they want to close with active threads (simplified to OK/Cancel)
-            from tkinter import messagebox
-            result = messagebox.askokcancel(
-                "Active Threads", 
-                f"There {'is' if active_count == 1 else 'are'} {active_count} active thread{'s' if active_count > 1 else ''} running.\n\n"
-                f"Closing will terminate {'it' if active_count == 1 else 'them'}. Continue?"
-            )
-            
-            if not result:  # User chose Cancel
-                return  # Don't close the application
-            
-            logger.info(f"User confirmed closing with {active_count} active threads")
-            logger.info("Shutting down threads...")
-            app_state.shutdown_all_threads()
-        
-        # Start timeout timer as backup
-        import threading
-        timeout_thread = threading.Thread(target=force_exit_after_timeout, daemon=True)
-        timeout_thread.start()
-        
-        # Save application state
-        app_state.save_state()
-        logger.info("Application state saved")
-        
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
-    
-    # Simplified but more reliable shutdown
-    try:
-        logger.info("Starting application shutdown...")
-        
-        # Stop the mainloop first
-        root.quit()
-        
-        # Give a moment for cleanup
-        root.update()
-        
-        # Destroy all widgets
-        root.destroy()
-        
-        logger.info("Tkinter cleanup completed")
-        
-    except Exception as e:
-        logger.error(f"Error during Tkinter cleanup: {e}")
-    
-    # Force exit using multiple methods
-    try:
-        import sys
-        import os
-        import signal
-        
-        logger.warning("Forcing application exit...")
-        
-        # Method 1: Standard exit
-        sys.exit(0)
-        
-    except:
-        try:
-            # Method 2: OS exit
-            os._exit(0)
-        except:
+        if s.current_batch_file in batch_files:
+            s.song_files = read_batch(selected_day_path, s.current_batch_file)
+        else:
+            s.current_batch_file = "batch.txt"
+            s.song_files = read_batch(selected_day_path)
+        if s.current_file_index is None:
+            s.current_file_index = 0
+
+        # Refresh batch files on startup
+        valid_files = sorted(
+            f for f in os.listdir(s.data_dir) if f.endswith('.wav') or f.endswith('.cbin'))
+        for batch in batch_files:
+            bp = os.path.join(s.data_dir, batch)
+            if batch == 'batch.txt':
+                with open(bp, 'w') as fh:
+                    fh.write('\n'.join(valid_files))
+            else:
+                with open(bp, 'r') as fh:
+                    keep = fh.read().splitlines()
+                with open(bp, 'w') as fh:
+                    fh.write('\n'.join(f for f in keep if f in valid_files))
+        s.song_files = read_batch(s.data_dir, s.current_batch_file)
+
+        # If the previously stored file is gone, default to the first file of the day.
+        if s.song_files:
+            if s.current_file_index is None or s.current_file_index < 0 or s.current_file_index >= len(s.song_files):
+                s.current_file_index = 0
+            else:
+                selected_name = s.song_files[s.current_file_index]
+                selected_path = os.path.join(s.data_dir, selected_name)
+                if not os.path.exists(selected_path):
+                    s.current_file_index = 0
+
+        # File combobox
+        self.file_combo = QComboBox()
+        self.file_combo.setMinimumWidth(260)
+        self.file_combo.addItems(s.song_files)
+        if s.song_files:
+            self.file_combo.setCurrentText(s.song_files[s.current_file_index])
+        s.combobox = self.file_combo
+        self.file_combo.currentTextChanged.connect(self._on_file_changed)
+        bar.addWidget(self.file_combo)
+
+        # Batch combobox
+        self.batch_combo = QComboBox()
+        self.batch_combo.setMinimumWidth(180)
+        self.batch_combo.addItems(batch_files)
+        self.batch_combo.setCurrentText(s.current_batch_file)
+        s.batch_combobox = self.batch_combo
+        self.batch_combo.currentTextChanged.connect(self._on_batch_changed)
+        bar.addWidget(self.batch_combo)
+
+        bar.addStretch()
+
+        # Segmented / Classified checkboxes
+        self.segmented_cb = QCheckBox("Segmented")
+        self.classified_cb = QCheckBox("Classified")
+        s.segmented_checkbox = self.segmented_cb
+        s.classified_checkbox = self.classified_cb
+        self.segmented_cb.stateChanged.connect(self._on_checkbox_toggle)
+        self.classified_cb.stateChanged.connect(self._on_checkbox_toggle)
+        bar.addWidget(self.segmented_cb)
+        bar.addSpacing(8)
+        bar.addWidget(self.classified_cb)
+
+        parent_layout.addLayout(bar)
+
+    # Plot area (matplotlib canvas + range slider)
+    def _build_plot_area(self, parent_layout):
+        s = self.app_state
+        plot_row = QHBoxLayout()
+
+        self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(
+            3, 1, figsize=(9, 5.5),
+            gridspec_kw={'height_ratios': [6, 1, 6]}, sharex=True)
+
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        s.set_axes(self.ax1, self.ax2, self.ax3)
+        s.set_canvas(self.canvas)
+        if s.song_files:
             try:
-                # Method 3: Kill signal (Unix/macOS)
-                os.kill(os.getpid(), signal.SIGTERM)
-            except:
+                s.display_dict = get_display_data(
+                    get_file_data_by_index(s.data_dir, s.song_files, s.current_file_index, s),
+                    s.config)
+            except Exception as exc:
+                s.logger.warning("Initial file load failed, will use plot fallback handling: %s", exc)
+                s.display_dict = None
+        else:
+            s.display_dict = None
+        s.ax3_background = s.canvas.copy_from_bbox(s.ax3.bbox)
+
+        plot_row.addWidget(self.canvas, stretch=1)
+
+        # Range slider
+        vmin_cfg = s.config['vmin_range_slider']
+        vmax_cfg = s.config['vmax_range_slider']
+        if (s.current_vmin is not None and s.current_vmax is not None
+                and s.current_vmin > vmin_cfg and s.current_vmax < vmax_cfg):
+            init_bot, init_top = s.current_vmin, s.current_vmax
+        else:
+            dist = (vmax_cfg - vmin_cfg) / 4
+            init_bot, init_top = vmin_cfg + dist, vmax_cfg - dist
+
+        self.range_slider = QRangeSliderV(vmin_cfg, vmax_cfg, init_bot, init_top)
+        self.range_slider.setFixedWidth(100)
+        self.range_slider.valuesChanged.connect(self._on_slider_changed)
+        plot_row.addWidget(self.range_slider)
+
+        parent_layout.addLayout(plot_row, stretch=1)
+
+        # Rectangle selectors
+        self.rect_sel_ax1 = RectangleSelector(
+            self.ax1, self._on_rect_select, useblit=True, button=[1],
+            minspanx=30, minspany=30, spancoords='pixels', interactive=False,
+            state_modifier_keys={"rotate": ""})
+        self.rect_sel_ax3 = RectangleSelector(
+            self.ax3, self._on_rect_select, useblit=True, button=[1],
+            minspanx=30, minspany=30, spancoords='pixels', interactive=False,
+            state_modifier_keys={"rotate": ""})
+
+    # ------------------------------------------------------------------
+    # Button bar
+    # ------------------------------------------------------------------
+    def _build_button_bar(self, parent_layout):
+        s = self.app_state
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 6, 0, 0)
+
+        refresh_text = "↻" if platform.system() == 'Darwin' else "⟳"
+        btn = lambda text, cb: self._make_btn(text, cb, bar)
+
+        bar.addStretch()
+        btn(refresh_text, lambda: update(s))
+        btn("Previous", lambda: (s.change_file(-1), plot_data(s)))
+        btn("Next", lambda: (s.change_file(1), plot_data(s)))
+        btn("  <  ", lambda: swipe_left(s))
+        btn("  >  ", lambda: swipe_right(s))
+        btn("🏠", lambda: unzoom(s))
+        btn("Zoom", lambda: zoom(s))
+        btn("Unzoom", lambda: unzoom_small(s))
+        btn("Crop", lambda: handle_crop(s))
+        btn("Delete", lambda: handle_delete(s))
+        btn("Play", lambda: handle_playback(s))
+        btn("Resegment", lambda: open_resegment_window(self, s))
+        btn("Relabel", lambda: open_relabel_window(self, s))
+        btn("Training", lambda: open_training_window(self, s))
+        btn("Cluster", lambda: open_cluster_window(self, s))
+        bar.addStretch()
+
+        parent_layout.addLayout(bar)
+
+    @staticmethod
+    def _make_btn(text, callback, layout):
+        b = QPushButton(text)
+        b.clicked.connect(callback)
+        layout.addWidget(b)
+        return b
+
+    # ------------------------------------------------------------------
+    # Radio buttons for edit mode
+    # ------------------------------------------------------------------
+    def _build_radio_bar(self, parent_layout):
+        bar = QHBoxLayout()
+        bar.addStretch()
+        self.edit_group = QButtonGroup(self)
+        options = [("None", 1), ("New Segment", 2), ("Delete Segment", 3),
+                   ("Move Segment", 4), ("Label Interactive", 5)]
+        for txt, val in options:
+            rb = QRadioButton(txt)
+            self.edit_group.addButton(rb, val)
+            bar.addWidget(rb)
+            if val == 1:
+                rb.setChecked(True)
+        self.edit_group.idToggled.connect(self._on_edit_type_toggled)
+        bar.addStretch()
+        parent_layout.addLayout(bar)
+
+        self.radio_adapter = RadioAdapter(self.edit_group)
+        self.app_state.reset_edit_type_gui = lambda: self.radio_adapter.set("1")
+
+    # ------------------------------------------------------------------
+    # Canvas events
+    # ------------------------------------------------------------------
+    def _connect_canvas_events(self):
+        s = self.app_state
+        self.canvas.mpl_connect('key_press_event',
+                                lambda ev: handle_keypress(ev, s, self.radio_adapter))
+        self.canvas.mpl_connect('button_press_event', lambda ev: select_event(ev, s))
+        self.canvas.mpl_connect('key_press_event', lambda ev: edit_syllable(ev, s))
+
+    # ------------------------------------------------------------------
+    # Slots
+    # ------------------------------------------------------------------
+    def _on_bird_changed(self):
+        self._populate_experiments()
+        self._populate_days()
+        self._on_day_changed()
+
+    def _on_experiment_changed(self):
+        self._populate_days()
+        self._on_day_changed()
+
+    def _on_day_changed(self):
+        s = self.app_state
+        if not s.init_flag:
+            return
+        self._set_data_dir_from_combos()
+        s.current_file_index = 0
+
+        batch_files = find_batch_files(s.data_dir)
+        set_combo_items(self.batch_combo, batch_files, "batch.txt")
+        if not batch_files:
+            create_batch_file(s.data_dir)
+        s.current_batch_file = "batch.txt"
+
+        s.song_files = read_batch(s.data_dir, s.current_batch_file)
+        set_combo_items(self.file_combo, s.song_files,
+                        s.song_files[s.current_file_index] if s.song_files else None)
+        if s.song_files:
+            plot_data(s)
+        else:
+            for ax in [s.ax1, s.ax2, s.ax3]:
+                ax.clear()
+            s.canvas.draw()
+
+    def _on_file_changed(self):
+        self.app_state.selected_syllable_index = None
+        s = self.app_state
+        selected = self.file_combo.currentText()
+        if selected and selected in s.song_files:
+            s.current_file_index = s.song_files.index(selected)
+            plot_data(s)
+
+    def _on_batch_changed(self):
+        s = self.app_state
+        selected = self.batch_combo.currentText()
+        if not selected:
+            return
+        s.current_batch_file = selected
+        s.song_files = read_batch(s.data_dir, selected)
+        s.current_file_index = 0 if s.song_files else None
+        set_combo_items(self.file_combo, s.song_files,
+                        s.song_files[0] if s.song_files else "")
+        if s.song_files:
+            plot_data(s)
+        else:
+            for ax in [s.ax1, s.ax2, s.ax3]:
+                ax.clear()
+            s.canvas.draw()
+
+    def _on_slider_changed(self, vmin, vmax):
+        s = self.app_state
+        s.current_vmin = vmin
+        s.current_vmax = vmax
+        s.redraw_spectrogram(vmin, vmax)
+
+    def _on_checkbox_toggle(self):
+        s = self.app_state
+        seg = "1" if self.segmented_cb.isChecked() else "0"
+        cla = "1" if self.classified_cb.isChecked() else "0"
+        s.segmented_var.set(seg)
+        s.classified_var.set(cla)
+        fp = get_file_data_by_index(s.data_dir, s.song_files, s.current_file_index, s)
+        rec_path = os.path.splitext(fp["file_path"])[0] + ".rec"
+        saved = save_seg_class_recfile(rec_path, seg, cla)
+        if not saved:
+            show_info(self, "Error", f"Could not save status because rec file is missing:\n{rec_path}")
+
+    def _on_rect_select(self, eclick, erelease):
+        if abs(eclick.xdata - erelease.xdata) * 1000 < 5:
+            return
+
+        def _set(axis, ec, er):
+            if ec.ydata > er.ydata:
+                ec.ydata, er.ydata = er.ydata, ec.ydata
+            if ec.xdata > er.xdata:
+                ec.xdata, er.xdata = er.xdata, ec.xdata
+            axis.set_xlim(ec.xdata, er.xdata)
+
+        if eclick.inaxes == self.ax1:
+            _set(self.ax1, eclick, erelease)
+        elif eclick.inaxes == self.ax3:
+            _set(self.ax3, eclick, erelease)
+        self.canvas.draw()
+
+    _EDIT_MAP = {1: "None", 2: "New Segment", 3: "Delete Segment",
+                 4: "Move Segment", 5: "Label Interactive"}
+
+    def _on_edit_type_toggled(self, btn_id, checked):
+        if not checked:
+            return
+        value = self._EDIT_MAP.get(btn_id, "None")
+        self.app_state.edit_type = value
+        # cursor = Qt.CursorShape.CrossCursor if value != "None" else Qt.CursorShape.ArrowCursor
+        cursor = (
+            Qt.CursorShape.ArrowCursor
+            if value in ("None", "Label Interactive")
+            else Qt.CursorShape.CrossCursor
+        )
+        self.canvas.setCursor(cursor)
+        if value == "None" and self.app_state.selected_syllable_index is not None:
+            if len(self.app_state.ax2.texts) <= self.app_state.selected_syllable_index:
                 try:
-                    # Method 4: Kill signal force (Unix/macOS)
-                    os.kill(os.getpid(), signal.SIGKILL)
-                except:
-                    pass
+                    self.app_state.ax2.texts[self.app_state.selected_syllable_index].set_color('black')
+                except IndexError:
+                    return  # better/other solution than changing 'if' statement
+            self.app_state.selected_syllable_index = None
+            self.canvas.draw_idle()
+        elif value == 'Label Interactive':
+            self.canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _populate_experiments(self):
+        bird = self.bird_combo.currentText()
+        if not bird:
+            return
+        exps = sorted(get_directories(os.path.join(self.app_state.config['rec_data'], bird)))
+        set_combo_items(self.experiment_combo, exps, exps[0] if exps else None)
+
+    def _populate_days(self):
+        bird = self.bird_combo.currentText()
+        exp = self.experiment_combo.currentText()
+        if not bird or not exp:
+            return
+        days = sorted(get_directories(
+            os.path.join(self.app_state.config['rec_data'], bird, exp)))
+        set_combo_items(self.day_combo, days, days[0] if days else None)
+
+    def _set_data_dir_from_combos(self):
+        self.app_state.data_dir = os.path.join(
+            self.app_state.config['rec_data'],
+            self.bird_combo.currentText(),
+            self.experiment_combo.currentText(),
+            self.day_combo.currentText())
+
+    # ------------------------------------------------------------------
+    # Close
+    # ------------------------------------------------------------------
+    def closeEvent(self, event):
+        s = self.app_state
+        g = self.geometry()
+        s.window_geometry = {
+            "x": g.x(),
+            "y": g.y(),
+            "width": g.width(),
+            "height": g.height(),
+        }
+        with s.thread_lock:
+            active = len(s.active_threads)
+        if active > 0:
+            reply = QMessageBox.question(
+                self, "Active Threads",
+                f"{active} thread(s) still running. Close anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                event.ignore()
+                return
+            s.shutdown_all_threads()
+
+        s.save_state()
+        logger.info("Application state saved")
+
+        # Timeout safety net
+        def _force():
+            time.sleep(3.0)
+            os._exit(1)
+
+        threading.Thread(target=_force, daemon=True).start()
+
+        event.accept()
+        QApplication.instance().quit()
 
 
 def main():
-    root.protocol("WM_DELETE_WINDOW", on_closing)
-    root.mainloop()
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("moove.gui")
+        except Exception as e:
+            logger.warning(f"Could not set Windows AppUserModelID early: {e}")
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("MooveGUI")
+    app.setOrganizationName("Moove")
+
+    icon_path = _resolve_icon_path()
+
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
+        # On macOS, also set the Dock / NSApplication icon so that
+        # QMessageBox and other system dialogs show the Moove logo
+        # instead of the default Python rocket.
+        if sys.platform == "darwin":
+            try:
+                from AppKit import NSApplication, NSImage
+                ns_image = NSImage.alloc().initByReferencingFile_(icon_path)
+                NSApplication.sharedApplication().setApplicationIconImage_(ns_image)
+            except Exception:
+                pass
+
+    window = MooveMainWindow()
+    if not window.restore_last_window_geometry():
+        window.resize(1200, 600)
+    window.show()
+    QTimer.singleShot(0, window._apply_native_windows_icon)
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

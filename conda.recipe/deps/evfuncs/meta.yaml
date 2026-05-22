@@ -1,0 +1,45 @@
+{% set python_min = "3.9" %}
+{% set version = "0.3.5.post1" %}
+
+package:
+  name: evfuncs
+  version: {{ version }}
+
+source:
+  url: https://pypi.org/packages/source/e/evfuncs/evfuncs-{{ version }}.tar.gz
+  sha256: 3b73bc49f9e22c0e78eb00be32df0d03d88c72f90373657b36cb03c02a6bb75a
+
+build:
+  noarch: python
+  script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+  number: 0
+
+requirements:
+  host:
+    - python {{ python_min }}.*
+    - flit-core >=3.2,<4
+    - pip
+  run:
+    - python >={{ python_min }}
+    - numpy >=1.18.1
+    - scipy >=1.2.0
+
+test:
+  imports:
+    - evfuncs
+  commands:
+    - pip check
+  requires:
+    - pip
+    - python {{ python_min }}.*
+
+about:
+  home: https://pypi.org/project/evfuncs/
+  summary: Functions for working with files created by the EvTAF program and the evsonganaly GUI
+  dev_url: https://github.com/NickleDave/evfuncs
+  license: BSD-3-Clause
+  license_file: LICENSE
+
+extra:
+  recipe-maintainers:
+    - AddYourGitHubIdHere

@@ -14,9 +14,9 @@ from dash import dcc, html
 from dash.dependencies import Input, Output, State
 from flask import Flask
 from wsgiref.simple_server import make_server, WSGIRequestHandler
-from tkinter import ttk, messagebox
 
-# Suppress Flask/Werkzeug/Dash logging to reduce console output
+from moove.qt_helpers import invoke_in_main_thread, show_info
+
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 logging.getLogger('flask').setLevel(logging.ERROR)
 logging.getLogger('dash').setLevel(logging.ERROR)
@@ -25,23 +25,20 @@ logging.getLogger('dash').setLevel(logging.ERROR)
 class QuietWSGIRequestHandler(WSGIRequestHandler):
     """Custom request handler that suppresses HTTP request logging."""
     def log_message(self, format, *args):
-        """Override to suppress all HTTP request logs."""
-        pass  # Do nothing - suppress all logs
+        pass
 
-# Global variables to store labels and point size
 labels = None
 point_size = 5
 
 
 def run_flask_server(app_state, dataset_name):
     """Create and run a Flask server for the Dash app."""
-    
+
     server = Flask(__name__)
     app = dash.Dash(__name__, server=server)
 
     global labels, point_size
     df = pd.read_pickle(os.path.join(app_state.config['global_dir'], 'cluster_data', f'{dataset_name}.pkl'))
-    # Use clustered_label (created after clustering/Dash editing)
     if 'clustered_label' not in df.columns:
         raise KeyError("Dataset has not been clustered yet. Please cluster the dataset first.")
     labels = df['clustered_label'].values
@@ -87,51 +84,51 @@ def run_flask_server(app_state, dataset_name):
                 html.Label("Label for selected points:", style={**common_style, 'width': 'auto'}),
                 dcc.Input(id='input-label', type='text', style={**common_style, 'margin-right': '5px'}),
                 html.Button('Apply', id='apply-button', style=button_style),
-                
+
                 html.Label("Change all labels from:", style={**common_style, 'width': 'auto'}),
                 dcc.Input(id='input-label-old', type='text', style={**common_style, 'margin-right': '5px'}),
                 html.Label("to:", style={**common_style, 'width': 'auto'}),
                 dcc.Input(id='input-label-new', type='text', style={**common_style, 'margin-right': '5px'}),
                 html.Button('Change All', id='change-all-button', style=button_style),
             ], style={
-                'display': 'flex', 
-                'align-items': 'center', 
-                'flex-wrap': 'nowrap', 
+                'display': 'flex',
+                'align-items': 'center',
+                'flex-wrap': 'nowrap',
                 'min-width': '0'
             }),
             html.Div([
                 html.Button('Save', id='save-button', style=button_style),
             ], style={
-                'display': 'flex', 
-                'justify-content': 'center', 
-                'align-items': 'center', 
+                'display': 'flex',
+                'justify-content': 'center',
+                'align-items': 'center',
                 'min-width': '0'
             }),
             html.Div([
                 html.Button('Increase Point Size', id='increase-size-button', style=button_style),
                 html.Button('Decrease Point Size', id='decrease-size-button', style=button_style),
             ], style={
-                'display': 'flex', 
-                'align-items': 'center', 
+                'display': 'flex',
+                'align-items': 'center',
                 'justify-content': 'flex-end',
-                'flex-wrap': 'nowrap', 
+                'flex-wrap': 'nowrap',
                 'min-width': '0'
             }),
         ], style={
-            'display': 'flex', 
-            'justify-content': 'space-between', 
-            'flex-wrap': 'nowrap', 
-            'width': '100%',  
+            'display': 'flex',
+            'justify-content': 'space-between',
+            'flex-wrap': 'nowrap',
+            'width': '100%',
             'margin-top': '10px',
             'padding': '0px',
             'align-items': 'center'
         }),
         html.Div(id='output-container')
     ], style={
-        'display': 'flex', 
-        'flex-direction': 'column', 
+        'display': 'flex',
+        'flex-direction': 'column',
         'height': '100vh',
-        'padding': '10px', 
+        'padding': '10px',
         'box-sizing': 'border-box'
     })
 
@@ -191,23 +188,21 @@ def run_flask_server(app_state, dataset_name):
         global labels
         df['clustered_label'] = labels
         df.to_pickle(os.path.join(app_state.config['global_dir'], 'cluster_data', f'{dataset_name}.pkl'))
-        
-        # Show Tkinter popup message instead of Dash message
+
         try:
-            messagebox.showinfo("Success", f"✅ Labels saved successfully!\n\nFile: {dataset_name}.pkl")
+            invoke_in_main_thread(lambda: show_info(
+                None, "Success", f"Labels saved successfully!\n\nFile: {dataset_name}.pkl"))
         except:
-            pass  # In case GUI is not available
-        
-        # Return empty div (no browser message)
+            pass
+
         return html.Div()
 
     app_state.logger.debug(f"Starting Flask server for dataset: {dataset_name}")
     app_state.server = make_server('localhost', 8050, server, handler_class=QuietWSGIRequestHandler)
     app_state.server_thread = threading.Thread(target=app_state.server.serve_forever, name="DashServerThread")
-    
-    # Register the server thread
+
     app_state.add_thread(app_state.server_thread)
-    
+
     app_state.server_thread.start()
     threading.Timer(1, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
 
@@ -216,7 +211,7 @@ def start_dash_app_thread(app_state, dataset_name):
     """Start the Dash application in a separate thread using AppState."""
 
     if dataset_name == "Select Cluster Dataset":
-        messagebox.showinfo("Error", "Selected cluster dataset not valid! Perhaps you forgot to pick a dataset?")
+        show_info(None, "Error", "Selected cluster dataset not valid! Perhaps you forgot to pick a dataset?")
     else:
         if app_state.dash_thread and app_state.dash_thread.is_alive():
             app_state.logger.debug("Dash app is already running.")
@@ -226,10 +221,7 @@ def start_dash_app_thread(app_state, dataset_name):
             app_state.logger.warning("Port 8050 is already in use.")
             return
 
-        # Start the Flask server and Dash app (this already creates a thread)
         run_flask_server(app_state, dataset_name)
-        
-        # Set the dash_thread to the server_thread (no need for double threading)
         app_state.dash_thread = app_state.server_thread
         app_state.logger.debug("Dash app thread started.")
 
@@ -263,9 +255,8 @@ def _async_raise(tid, exctype):
 def stop_dash_app_thread(app_state):
     """Properly stop the Dash application by shutting down the server and threads."""
     app_state.logger.debug("=== STOP DASH APP CALLED ===")
-    
+
     try:
-        # Stop the Flask server first
         if hasattr(app_state, 'server') and app_state.server:
             app_state.logger.debug("Shutting down Flask server.")
             app_state.server.shutdown()
@@ -273,44 +264,38 @@ def stop_dash_app_thread(app_state):
             app_state.logger.debug("Flask server shutdown complete.")
         else:
             app_state.logger.debug("No Flask server found to shutdown.")
-        
-        # Stop the server thread
+
         if hasattr(app_state, 'server_thread') and app_state.server_thread and app_state.server_thread.is_alive():
             app_state.logger.debug("Stopping server thread.")
-            app_state.server_thread.join(timeout=2)  # Wait up to 2 seconds
+            app_state.server_thread.join(timeout=2)
             app_state.server_thread = None
             app_state.logger.debug("Server thread stopped.")
         else:
             app_state.logger.debug("No server thread found to stop.")
-        
-        # Stop the dash thread
+
         if app_state.dash_thread and app_state.dash_thread.is_alive():
             app_state.logger.debug("Stopping Dash application thread.")
             try:
-                # Try graceful shutdown first
-                app_state.dash_thread.join(timeout=2)  # Wait up to 2 seconds
+                app_state.dash_thread.join(timeout=2)
                 app_state.logger.debug("Dash thread joined gracefully.")
             except Exception as join_error:
-                # If graceful shutdown fails, force kill
                 app_state.logger.debug(f"Graceful join failed: {join_error}. Forcefully terminating the Dash server thread.")
                 kill_thread(app_state.dash_thread)
                 app_state.logger.debug("Dash thread force killed.")
-            
+
             app_state.dash_thread = None
         else:
             app_state.logger.debug("No Dash thread found to stop.")
-        
+
         app_state.logger.debug("=== DASH APP SUCCESSFULLY STOPPED ===")
-        
-        # Show confirmation message
+
         try:
-            messagebox.showinfo("Dash GUI", "Dash GUI closed successfully!")
+            invoke_in_main_thread(lambda: show_info(None, "Dash GUI", "Dash GUI closed successfully!"))
         except:
             pass
-        
+
     except Exception as e:
         app_state.logger.error(f"Error while stopping Dash app: {e}")
-        # Fallback: force kill if everything else fails
         if app_state.dash_thread and app_state.dash_thread.is_alive():
             try:
                 kill_thread(app_state.dash_thread)

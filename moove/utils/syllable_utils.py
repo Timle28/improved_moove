@@ -1,6 +1,7 @@
 # utils/syllable_utils.py
 import numpy as np
 import os
+from matplotlib.patches import Rectangle
 
 
 def add_new_segment(event, app_state):
@@ -64,28 +65,47 @@ def select_event(event, app_state):
         move_segment(event, app_state)
 
 
+def _redraw_ax2_labels(app_state):
+    """Fast redraw for ax2 labels without restoring cached backgrounds."""
+    if app_state.ax2 is None or app_state.canvas is None:
+        return
+
+    ax2 = app_state.ax2
+
+    # Temporary white overlay to cover old glyph pixels before redrawing labels.
+    wipe = Rectangle(
+        (0.0, 0.0), 1.0, 1.0,
+        transform=ax2.transAxes,
+        facecolor='white',
+        edgecolor='none',
+        zorder=0,
+        clip_on=False,
+    )
+    ax2.draw_artist(wipe)
+
+    for text in ax2.texts:
+        ax2.draw_artist(text)
+
+    app_state.canvas.blit(ax2.bbox)
+
+
 def highlight_syllable(idx, app_state):
     """Highlight the selected syllable."""
-    if app_state.selected_syllable_index is not None:
-        app_state.ax2.texts[app_state.selected_syllable_index].set_color('black')
+    if idx < 0 or idx >= len(app_state.ax2.texts):
+        return
+
+    prev_idx = app_state.selected_syllable_index
+    if prev_idx is not None and 0 <= prev_idx < len(app_state.ax2.texts):
+        app_state.ax2.texts[prev_idx].set_color('black')
  
     app_state.selected_syllable_index = idx
     app_state.ax2.texts[idx].set_color('red')
- 
-    # Restore ax2 background
-    app_state.canvas.restore_region(app_state.ax2_background)
- 
-    # Redraw updated text
-    for text in app_state.ax2.texts:
-        app_state.ax2.draw_artist(text)
- 
-    # Blit only ax2 region
-    app_state.canvas.blit(app_state.ax2.bbox)
+
+    _redraw_ax2_labels(app_state)
 
 
 def edit_syllable(event, app_state):
     """Edit the selected syllable label."""
-    from moove.utils.plot_utils import update_ax2
     from moove.utils import save_notmat
     import os
 
@@ -113,11 +133,13 @@ def edit_syllable(event, app_state):
         labels[app_state.selected_syllable_index] = event.key
         display_dict["labels"] = ''.join(labels)
 
+        # Update only the changed text artist to keep interaction responsive.
+        app_state.ax2.texts[app_state.selected_syllable_index].set_text(event.key)
+
         save_notmat(
             os.path.join(app_state.data_dir, f"{display_dict['file_name']}.not.mat"),
             display_dict
         )
-        update_ax2(app_state.ax2, display_dict, app_state)
         next_idx = (app_state.selected_syllable_index + 1) % num_labels
         highlight_syllable(next_idx, app_state)
 
@@ -250,12 +272,10 @@ def handle_keypress(event, app_state, v):
         edit_type = "None"
         v.set("1")
         if app_state.selected_syllable_index is not None:
-            app_state.ax2.texts[app_state.selected_syllable_index].set_color('black')
+            idx = app_state.selected_syllable_index
+            app_state.ax2.texts[idx].set_color('black')
             app_state.selected_syllable_index = None
-            app_state.canvas.restore_region(app_state.ax2_background)
-            for text in app_state.ax2.texts:
-                app_state.ax2.draw_artist(text)
-            app_state.canvas.blit(app_state.ax2.bbox)
+            _redraw_ax2_labels(app_state)
     elif edit_type != "Label Interactive":
         if event.key == 'm':
             edit_type = "Move Segment"

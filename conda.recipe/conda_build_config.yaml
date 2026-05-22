@@ -1,0 +1,7 @@
+channel_sources:
+  - local
+  - conda-forge
+  - defaults
+
+channel_targets:
+  - local main

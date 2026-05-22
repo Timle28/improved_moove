@@ -1,0 +1,108 @@
+name: Test Matrix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow_failure }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+            allow_failure: false
+          - os: ubuntu-latest
+            python-version: "3.11"
+            allow_failure: false
+          - os: ubuntu-latest
+            python-version: "3.12"
+            allow_failure: false
+          - os: macos-latest
+            python-version: "3.10"
+            allow_failure: false
+          - os: macos-latest
+            python-version: "3.11"
+            allow_failure: false
+          - os: macos-latest
+            python-version: "3.12"
+            allow_failure: false
+          - os: windows-latest
+            python-version: "3.10"
+            allow_failure: true
+          - os: windows-latest
+            python-version: "3.11"
+            allow_failure: true
+          - os: windows-latest
+            python-version: "3.12"
+            allow_failure: true
+
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Linux GUI libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-xinerama0 libgl1 libglib2.0-0 libportaudio2 portaudio19-dev
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Replace torch with CPU-only build (Windows)
+        if: runner.os == 'Windows'
+        run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          echo "=== System ==="
+          uname -a || true
+          echo "=== Python ==="
+          uv run python -V || true
+          echo "=== Torch import ==="
+          uv run python - <<'PY'
+          import traceback
+          try:
+            import torch
+            print("torch:", torch.__version__)
+            print("cuda available:", torch.cuda.is_available())
+          except Exception:
+            traceback.print_exc()
+          PY
+          echo "=== Qt import ==="
+          uv run python - <<'PY'
+          import traceback
+          try:
+            from PyQt6 import QtCore
+            print("Qt:", QtCore.QT_VERSION_STR)
+          except Exception:
+            traceback.print_exc()
+          PY

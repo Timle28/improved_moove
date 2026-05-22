@@ -1,609 +1,866 @@
-# utils/window_utils.py
+# utils/window_utils.py – PyQt6 dialog windows
 import os
-import tkinter as tk
-from tkinter import ttk
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
+    QComboBox, QPushButton, QCheckBox, QRadioButton, QButtonGroup,
+    QProgressBar, QWidget, QSizePolicy, QMessageBox,
+)
+from PyQt6.QtCore import Qt
+
+from moove.app_state import Var
+from moove.qt_helpers import show_info
 
 
-def open_resegment_window(root, app_state, bird_combobox, experiment_combobox, day_combobox):
-    """Open the resegmentation window for segmenting the current file using Evfuncs or the Segmentation Network."""
-    from moove.utils import start_segment_evfuncs, start_segment_files_thread
+def _btn(text, callback=None):
+    """Create a QPushButton with autoDefault disabled (avoids blue highlight on macOS)."""
+    b = QPushButton(text)
+    b.setAutoDefault(False)
+    b.setDefault(False)
+    if callback:
+        b.clicked.connect(callback)
+    return b
 
-    resegment_window = tk.Toplevel(root)
-    resegment_window.title("Resegmentation")
-    app_state.resegment_window = resegment_window
 
-    resegment_window.geometry("400x450")
-    resegment_window.grid_rowconfigure(0, weight=1)
-    resegment_window.grid_columnconfigure(0, weight=1)
-    resegment_window.grid_columnconfigure(1, weight=1)
-    # ensure the window stays in front
-    resegment_window.transient(root)
+def _set_dlg_icon(dlg):
+    """Copy the application-level icon onto a dialog so child message boxes inherit it."""
+    app = dlg.parent()
+    while app is not None and hasattr(app, 'windowIcon'):
+        icon = app.windowIcon()
+        if not icon.isNull():
+            dlg.setWindowIcon(icon)
+            return
+        app = app.parent() if hasattr(app, 'parent') else None
+    from PyQt6.QtWidgets import QApplication
+    app_icon = QApplication.instance().windowIcon()
+    if not app_icon.isNull():
+        dlg.setWindowIcon(app_icon)
 
-    container_frame = tk.Frame(resegment_window)
-    container_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
-    container_frame.grid_columnconfigure(0, weight=1)
-    container_frame.grid_columnconfigure(1, weight=1)
 
-    # Left frame for Evfuncs
-    left_frame = tk.Frame(container_frame)
-    left_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
-    left_frame.grid_columnconfigure(0, weight=1)
-    left_frame.grid_columnconfigure(1, weight=1)
+def _get_bird_exp_day(app_state):
+    """Read current bird/experiment/day from the stored comboboxes."""
+    b = app_state.bird_combobox.currentText() if app_state.bird_combobox else ""
+    e = app_state.experiment_combobox.currentText() if app_state.experiment_combobox else ""
+    d = app_state.day_combobox.currentText() if app_state.day_combobox else ""
+    return b, e, d
+
+
+# ======================================================================
+# Resegment Dialog
+# ======================================================================
+def open_resegment_window(parent, app_state):
+    from moove.utils import start_segment_evfuncs, start_segment_files_thread, plot_data
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Resegmentation")
+    dlg.resize(700, 450)
+    _set_dlg_icon(dlg)
+    app_state.resegment_window = dlg
+    dlg._task_running = False
+    dlg._task_cancel_requested = False
+
+    def _resegment_close_event(event):
+        if getattr(dlg, '_task_running', False):
+            reply = QMessageBox.question(
+                dlg,
+                "Resegmentation is still running",
+                "A resegmentation job is still running. Abort it and close this window?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                dlg._task_cancel_requested = True
+                event.accept()
+                return
+            event.ignore()
+            return
+        event.accept()
+
+    dlg.closeEvent = _resegment_close_event
+
+    root = QVBoxLayout(dlg)
+    root.setContentsMargins(8, 8, 8, 8)
+    panels = QHBoxLayout()
+    panels.setAlignment(Qt.AlignmentFlag.AlignTop)
+    root.addLayout(panels, stretch=1)
+
+    # --- Left: Evfuncs ---
+    left = QGridLayout()
+    left_w = QWidget()
+    left_w.setLayout(left)
+    left_w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    panels.addWidget(left_w, stretch=1, alignment=Qt.AlignmentFlag.AlignTop)
 
     row = 0
-    tk.Label(left_frame, text="Evfuncs", font=("Arial", 16)).grid(row=row, column=0, columnspan=2, pady=10, sticky="ew")
+    left.addWidget(QLabel("<b style='font-size:16px'>Evfuncs</b>"), row, 0, 1, 2, Qt.AlignmentFlag.AlignCenter)
     row += 1
 
-    def update_batch_combobox_resegment_ev():
-        app_state.update_batch_select_combobox_resegment_ev(select_path=ev_selection_var.get())
+    ev_sel = Var("current_file")
+    ev_group = QButtonGroup(dlg)
+    for txt, val in [("Current File", "current_file"), ("Current Day", "current_day"),
+                     ("Current Experiment", "current_experiment"), ("Current Bird", "current_bird")]:
+        rb = QRadioButton(txt)
+        ev_group.addButton(rb)
+        if val == "current_file":
+            rb.setChecked(True)
 
-    # Radio buttons for Evfuncs selection
-    ev_selection_var = tk.StringVar(value="current_file")
-    tk.Radiobutton(left_frame, text="Current File", variable=ev_selection_var, value="current_file").grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(left_frame, text="Current Day", variable=ev_selection_var, value="current_day",
-                   command=update_batch_combobox_resegment_ev).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(left_frame, text="Current Experiment", variable=ev_selection_var, value="current_experiment",
-                   command=update_batch_combobox_resegment_ev).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(left_frame, text="Current Bird", variable=ev_selection_var, value="current_bird",
-                   command=update_batch_combobox_resegment_ev).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
+        def _make_cb(v=val):
+            return lambda: (ev_sel.set(v), app_state.update_batch_select_combobox_resegment_ev(v))
 
-    # Combobox for batch file selection
-    ev_batch_file_var = tk.StringVar()
-    resegment_batch_combobox_ev = ttk.Combobox(left_frame,textvariable=ev_batch_file_var)
-    resegment_batch_combobox_ev.set("Select Batch File")
-    app_state.resegment_window.resegment_batch_combobox_ev = resegment_batch_combobox_ev
-    app_state.update_batch_select_combobox_resegment_ev(select_path = ev_selection_var.get())
-    resegment_batch_combobox_ev.grid(row=2, column=1, sticky="ew")
-
-    evfuncs_params = [
-        ("Threshold:", 'threshold'),
-        ("Min Syllable Length:", 'min_syl_dur'),
-        ("Min Silent Duration:", 'min_silent_dur'),
-        ("Frequency Cutoffs:", 'freq_cutoffs'),
-        ("Smoothing Window:", 'smooth_window')
-    ]
-
-    for label_text, param_key in evfuncs_params:
-        tk.Label(left_frame, text=label_text).grid(row=row, column=0, sticky="w")
-        entry = tk.Entry(left_frame, textvariable=app_state.evfuncs_params[param_key])
-        entry.grid(row=row, column=1, sticky="ew")
+        rb.toggled.connect(lambda checked, cb=_make_cb(): cb() if checked else None)
+        left.addWidget(rb, row, 0, 1, 2)
         row += 1
 
-    segment_btn_evfuncs = tk.Button(
-        left_frame, text="Segment",
-        command=lambda: start_segment_evfuncs(app_state, ev_selection_var.get(), ev_batch_file_var.get(), bird_combobox, experiment_combobox, day_combobox)
-    )
-    segment_btn_evfuncs.grid(row=row, column=0, columnspan=2, pady=(10, 0), sticky="ew")
+    ev_batch_combo = QComboBox()
+    ev_batch_combo.addItem("Select Batch File")
+    dlg.resegment_batch_combobox_ev = ev_batch_combo
+    app_state.update_batch_select_combobox_resegment_ev(ev_sel.get())
+    left.addWidget(ev_batch_combo, 2, 1)
 
-    # Right frame for Segmentation Network
-    right_frame = tk.Frame(container_frame)
-    right_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
-    right_frame.grid_columnconfigure(0, weight=1)
-    right_frame.grid_columnconfigure(1, weight=1)
+    evfuncs_params = [("Threshold:", 'threshold'), ("Min Syllable Length:", 'min_syl_dur'),
+                      ("Min Silent Duration:", 'min_silent_dur'), ("Frequency Cutoffs:", 'freq_cutoffs'),
+                      ("Smoothing Window:", 'smooth_window')]
+    ev_entries = {}
+    for label_text, key in evfuncs_params:
+        left.addWidget(QLabel(label_text), row, 0)
+        entry = QLineEdit(app_state.evfuncs_params[key].get())
+        ev_entries[key] = entry
+        left.addWidget(entry, row, 1)
+        row += 1
+
+    def _do_ev_segment():
+        if getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A resegmentation job is already running.")
+            return
+        for k, e in ev_entries.items():
+            app_state.evfuncs_params[k].set(e.text())
+        b, e, d = _get_bird_exp_day(app_state)
+        start_segment_evfuncs(app_state, ev_sel.get(), ev_batch_combo.currentText(), b, e, d)
+
+    btn_ev = _btn("Segment", _do_ev_segment)
+    left.addWidget(btn_ev, row, 0, 1, 2)
+    row += 1
+    left.addWidget(QLabel("<b style='font-size:16px'></b>"), row, 0, 1, 2, Qt.AlignmentFlag.AlignCenter)
+    row += 1
+    left.addWidget(QLabel("<b style='font-size:16px'>Set Manual Threshold</b>"), row, 0, 1, 2,
+                   Qt.AlignmentFlag.AlignCenter)
+    row += 1
+    left.addWidget(QLabel("New Threshold"), row, 0)
+    entry_thres = QLineEdit(app_state.evfuncs_params['threshold'].get())
+    left.addWidget(entry_thres, row, 1)
+    row += 1
+
+    def _do_get_threshold():
+        app_state.evfuncs_params['threshold'].set(entry_thres.text())
+        plot_data(app_state)
+
+    btn_ev = _btn("Set Threshold", _do_get_threshold)
+    left.addWidget(btn_ev, row, 0, 1, 2)
+
+    # --- Right: Segmentation Network ---
+    right = QGridLayout()
+    right_w = QWidget()
+    right_w.setLayout(right)
+    right_w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    panels.addWidget(right_w, stretch=1, alignment=Qt.AlignmentFlag.AlignTop)
 
     row = 0
-    tk.Label(right_frame, text="Segmentation Network", font=("Arial", 16)).grid(row=row, column=0, columnspan=2, pady=10, sticky="ew")
+    right.addWidget(QLabel("<b style='font-size:16px'>Segmentation Network</b>"), row, 0, 1, 2,
+                    Qt.AlignmentFlag.AlignCenter)
     row += 1
 
-    def update_batch_combobox_resegment():
-        app_state.update_batch_select_combobox_resegment(select_path=sm_selection_var.get())
+    sm_sel = Var("current_file")
+    sm_group = QButtonGroup(dlg)
+    for txt, val in [("Current File", "current_file"), ("Current Day", "current_day"),
+                     ("Current Experiment", "current_experiment"), ("Current Bird", "current_bird")]:
+        rb = QRadioButton(txt)
+        sm_group.addButton(rb)
+        if val == "current_file":
+            rb.setChecked(True)
 
-    # Radio buttons for Segmentation Network selection
-    sm_selection_var = tk.StringVar(value="current_file")
-    tk.Radiobutton(right_frame, text="Current File", variable=sm_selection_var, value="current_file").grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(right_frame, text="Current Day", variable=sm_selection_var, value="current_day",
-                   command=update_batch_combobox_resegment).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(right_frame, text="Current Experiment", variable=sm_selection_var, value="current_experiment",
-                   command=update_batch_combobox_resegment).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(right_frame, text="Current Bird", variable=sm_selection_var, value="current_bird",
-                   command=update_batch_combobox_resegment).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
+        def _make_cb(v=val):
+            return lambda: (sm_sel.set(v), app_state.update_batch_select_combobox_resegment(v))
 
-    # Combobox for batch file selection
-    batch_file_var = tk.StringVar()
-    resegment_batch_combobox = ttk.Combobox(right_frame,textvariable=batch_file_var)
-    resegment_batch_combobox.set("Select Batch File")
-    app_state.resegment_window.resegment_batch_combobox = resegment_batch_combobox
-    app_state.update_batch_select_combobox_resegment(select_path = sm_selection_var.get())
-    resegment_batch_combobox.grid(row=2, column=1, sticky="ew")
+        rb.toggled.connect(lambda checked, cb=_make_cb(): cb() if checked else None)
+        right.addWidget(rb, row, 0, 1, 2)
+        row += 1
 
-    checkbox_var = tk.BooleanVar()
-    tk.Checkbutton(right_frame, text="Overwrite Already Segmented Files", variable=checkbox_var).grid(row=row, column=0, columnspan=2, sticky="w")
+    sm_batch_combo = QComboBox()
+    sm_batch_combo.addItem("Select Batch File")
+    dlg.resegment_batch_combobox = sm_batch_combo
+    app_state.update_batch_select_combobox_resegment(sm_sel.get())
+    right.addWidget(sm_batch_combo, 2, 1)
+
+    overwrite_cb = QCheckBox("Overwrite Already Segmented Files")
+    right.addWidget(overwrite_cb, row, 0, 1, 2)
     row += 1
 
-    # Model selection combobox
     trained_models_path = os.path.join(app_state.config["global_dir"], "trained_models")
     model_files = [f[:-4] for f in os.listdir(trained_models_path) if f.endswith("_seg_model.pth")]
-    app_state.current_segmentation_model = tk.StringVar()
-    model_combobox = ttk.Combobox(right_frame, textvariable=app_state.current_segmentation_model)
-    model_combobox['values'] = model_files
-    model_combobox.set("Select Trained Segmentation Model")
-    model_combobox.grid(row=row, column=0, columnspan=2, sticky="ew")
+    model_combo = QComboBox()
+    model_combo.addItem("Select Trained Segmentation Model")
+    model_combo.addItems(model_files)
+    right.addWidget(model_combo, row, 0, 1, 2)
     row += 1
 
-    params = [
-        ("Decision Threshold:", 'decision_threshold'),
-        ("Onset Window Size:", 'onset_window_size'),
-        ("N Onset True:", 'n_onset_true'),
-        ("Offset Window Size:", 'offset_window_size'),
-        ("N Offset False:", 'n_offset_false'),
-        ("Min Syllable Length:", 'min_syllable_length'),
-        ("Min Silent Duration:", 'min_silent_duration')
-    ]
-
-    for label_text, param_key in params:
-        tk.Label(right_frame, text=label_text).grid(row=row, column=0, sticky="w")
-        entry = tk.Entry(right_frame, textvariable=app_state.mlseg_params[param_key])
-        entry.grid(row=row, column=1, sticky="ew")
+    params = [("Decision Threshold:", 'decision_threshold'), ("Onset Window Size:", 'onset_window_size'),
+              ("N Onset True:", 'n_onset_true'), ("Offset Window Size:", 'offset_window_size'),
+              ("N Offset False:", 'n_offset_false'), ("Min Syllable Length:", 'min_syllable_length'),
+              ("Min Silent Duration:", 'min_silent_duration')]
+    ml_entries = {}
+    for label_text, key in params:
+        right.addWidget(QLabel(label_text), row, 0)
+        entry = QLineEdit(app_state.mlseg_params[key].get())
+        ml_entries[key] = entry
+        right.addWidget(entry, row, 1)
         row += 1
 
-        # Additional spacing for readability after certain parameters
-        if param_key in ['chunk_size', 'decision_threshold', 'n_offset_false']:
-            row += 1
+    # Status widgets
+    dlg.status_label = QLabel("")
+    dlg.status_label.setStyleSheet("color: green; font-size: 14px;")
+    dlg.status_label.hide()
+    dlg.progressbar = QProgressBar()
+    dlg.progressbar.hide()
 
-    # Segment button for Segmentation Network
-    segment_btn_ml = tk.Button(
-        right_frame, text="Segment",
-        command=lambda: start_segment_files_thread(app_state, app_state.current_segmentation_model.get(),
-                                                    sm_selection_var.get(), checkbox_var.get(), batch_file_var.get(),
-                                                      bird_combobox, experiment_combobox, day_combobox)
-    )
-    segment_btn_ml.grid(row=row, column=0, columnspan=2, pady=(10, 0), sticky="ew")
+    def _do_ml_segment():
+        if getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A resegmentation job is already running.")
+            return
+        for k, e in ml_entries.items():
+            app_state.mlseg_params[k].set(e.text())
+        sel_model = model_combo.currentText()
+        if sel_model == "Select Trained Segmentation Model":
+            sel_model = ""
+        b, e, d = _get_bird_exp_day(app_state)
+        start_segment_files_thread(app_state, sel_model, sm_sel.get(),
+                                   overwrite_cb.isChecked(), sm_batch_combo.currentText(),
+                                   b, e, d)
 
-    # Adjust window size to content
-    resegment_window.update_idletasks()
-    resegment_window.minsize(resegment_window.winfo_reqwidth(), resegment_window.winfo_reqheight())
+    btn_ml = _btn("Segment", _do_ml_segment)
+    right.addWidget(btn_ml, row, 0, 1, 2)
+
+    root.addWidget(dlg.status_label)
+    root.addWidget(dlg.progressbar)
+
+    dlg.show()
 
 
-def open_relabel_window(root, app_state, bird_combobox, experiment_combobox, day_combobox):
-    """Open the relabel window for relabeling the current file using the Classification Network."""
+# ======================================================================
+# Relabel Dialog
+# ======================================================================
+def open_relabel_window(parent, app_state):
     from moove.utils import start_classify_files_thread
 
-    relabel_window = tk.Toplevel(root)
-    relabel_window.title("Relabel")
-    app_state.relabel_window = relabel_window
-    # ensure the window stays in front
-    relabel_window.transient(root)
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Relabel")
+    dlg.setMinimumWidth(400)
+    _set_dlg_icon(dlg)
+    app_state.relabel_window = dlg
+    dlg._task_running = False
+    dlg._task_cancel_requested = False
 
-    relabel_window.geometry("400x280")
-    relabel_window.grid_rowconfigure(0, weight=1)
-    relabel_window.grid_columnconfigure(0, weight=1)
+    def _relabel_close_event(event):
+        if getattr(dlg, '_task_running', False):
+            reply = QMessageBox.question(
+                dlg,
+                "Relabeling is still running",
+                "A relabeling job is still running. Abort it and close this window?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                dlg._task_cancel_requested = True
+                event.accept()
+                return
+            event.ignore()
+            return
+        event.accept()
 
-    # Container Frame for layout
-    container_frame = tk.Frame(relabel_window)
-    container_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-    container_frame.grid_rowconfigure(0, weight=1)
-    container_frame.grid_columnconfigure(0, weight=1)
+    dlg.closeEvent = _relabel_close_event
 
-    # Frame for content
-    content_frame = tk.Frame(container_frame)
-    content_frame.grid(row=0, column=0, sticky="nsew")
-    content_frame.grid_rowconfigure(99, weight=1)
-    content_frame.grid_columnconfigure(0, weight=1)
-    content_frame.grid_columnconfigure(1, weight=1)
-
+    outer = QVBoxLayout(dlg)
+    outer.setContentsMargins(8, 8, 8, 8)
+    grid = QGridLayout()
+    outer.addLayout(grid)
     row = 0
-    # Header Label
-    tk.Label(content_frame, text="Classification Network", font=("Arial", 16)).grid(row=row, column=0, columnspan=2, pady=10, sticky="nsew")
+    grid.addWidget(QLabel("<b style='font-size:16px'>Classification Network</b>"), row, 0, 1, 2,
+                   Qt.AlignmentFlag.AlignCenter)
     row += 1
 
-    def update_batch_combobox_relabel():
-        app_state.update_batch_select_combobox_relabel(select_path=selection_var.get())
+    sel = Var("current_file")
+    grp = QButtonGroup(dlg)
+    for txt, val in [("Current File", "current_file"), ("Current Day", "current_day"),
+                     ("Current Experiment", "current_experiment"), ("Current Bird", "current_bird")]:
+        rb = QRadioButton(txt)
+        grp.addButton(rb)
+        if val == "current_file":
+            rb.setChecked(True)
 
-    # Radio buttons for selection
-    selection_var = tk.StringVar(value="current_file")
-    tk.Radiobutton(content_frame, text="Current File", variable=selection_var, value="current_file").grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(content_frame, text="Current Day", variable=selection_var, value="current_day",
-                   command=update_batch_combobox_relabel).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(content_frame, text="Current Experiment", variable=selection_var, value="current_experiment",
-                   command=update_batch_combobox_relabel).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(content_frame, text="Current Bird", variable=selection_var, value="current_bird",
-                   command=update_batch_combobox_relabel).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
+        def _make_cb(v=val):
+            return lambda: (sel.set(v), app_state.update_batch_select_combobox_relabel(v))
 
-    # Combobox for batch file selection
-    batch_file_var = tk.StringVar()
-    relabel_batch_combobox = ttk.Combobox(content_frame,textvariable=batch_file_var, width=5)
-    relabel_batch_combobox.set("Select Batch File")
-    app_state.relabel_window.relabel_batch_combobox = relabel_batch_combobox
-    app_state.update_batch_select_combobox_relabel(select_path = selection_var.get())
-    relabel_batch_combobox.grid(row=2, column=1, sticky="ew")
+        rb.toggled.connect(lambda checked, cb=_make_cb(): cb() if checked else None)
+        grid.addWidget(rb, row, 0, 1, 2)
+        row += 1
 
-    checkbox_var = tk.BooleanVar()
-    tk.Checkbutton(content_frame, text="Overwrite Already Classified Files", variable=checkbox_var).grid(row=row, column=0, columnspan=2, sticky="w")
+    batch_combo = QComboBox()
+    batch_combo.addItem("Select Batch File")
+    dlg.relabel_batch_combobox = batch_combo
+    app_state.update_batch_select_combobox_relabel(sel.get())
+    grid.addWidget(batch_combo, 2, 1)
+
+    overwrite_cb = QCheckBox("Overwrite Already Classified Files")
+    grid.addWidget(overwrite_cb, row, 0, 1, 2)
     row += 1
 
-    # ComboBox for selecting models
     trained_models_path = os.path.join(app_state.config["global_dir"], "trained_models")
     model_files = [f[:-4] for f in os.listdir(trained_models_path) if f.endswith("_class_model.pth")]
-    app_state.current_classification_model = tk.StringVar()
-    model_combobox = ttk.Combobox(content_frame, textvariable=app_state.current_classification_model)
-    model_combobox['values'] = model_files
-    model_combobox.set("Select Trained Classification Model")
-    model_combobox.grid(row=row, column=0, columnspan=2, sticky="ew")
+    model_combo = QComboBox()
+    model_combo.addItem("Select Trained Classification Model")
+    model_combo.addItems(model_files)
+    grid.addWidget(model_combo, row, 0, 1, 2)
     row += 1
 
-    # Relabel Button
-    segment_btn_ml = tk.Button(content_frame, text="Relabel", command=lambda: start_classify_files_thread(app_state, app_state.current_classification_model.get(),
-                                                                                                           selection_var.get(), checkbox_var.get(), batch_file_var.get(),
-                                                                                                             bird_combobox, experiment_combobox, day_combobox))
-    segment_btn_ml.grid(row=row, column=0, columnspan=2, sticky="ew")
+    dlg.status_label = QLabel("")
+    dlg.status_label.setStyleSheet("color: green; font-size: 14px;")
+    dlg.status_label.hide()
+    dlg.progressbar = QProgressBar()
+    dlg.progressbar.hide()
 
-    # Adjust window size to content
-    relabel_window.update_idletasks()
-    relabel_window.minsize(relabel_window.winfo_reqwidth(), relabel_window.winfo_reqheight())
+    def _do_relabel():
+        if getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A relabeling job is already running.")
+            return
+        sel_model = model_combo.currentText()
+        if sel_model == "Select Trained Classification Model":
+            sel_model = ""
+        b, e, d = _get_bird_exp_day(app_state)
+        start_classify_files_thread(app_state, sel_model, sel.get(),
+                                    overwrite_cb.isChecked(), batch_combo.currentText(),
+                                    b, e, d)
+
+    btn = _btn("Relabel", _do_relabel)
+    grid.addWidget(btn, row, 0, 1, 2)
+
+    outer.addWidget(dlg.status_label)
+    outer.addWidget(dlg.progressbar)
+
+    dlg.adjustSize()
+    dlg.setFixedHeight(dlg.sizeHint().height())
+    dlg.show()
 
 
-def open_training_window(root, app_state, bird_combobox, experiment_combobox, day_combobox):
-    """Open the training window for training the Segmentation and Classification Networks."""
+# ======================================================================
+# Training Dialog
+# ======================================================================
+def open_training_window(parent, app_state):
     from moove.utils import (
         start_create_segmentation_training_dataset, start_segmentation_training,
-        start_create_classification_training_dataset, start_classification_training, 
-        find_batch_files
+        start_create_classification_training_dataset, start_classification_training,
     )
 
-    training_window = tk.Toplevel(root)
-    training_window.title("Training")
-    training_window.geometry("400x540")
-    app_state.training_window = training_window
-    # ensure the window stays in front
-    training_window.transient(root)
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Training")
+    dlg.resize(700, 560)
+    _set_dlg_icon(dlg)
+    app_state.training_window = dlg
+    dlg._training_running = False
+    dlg._training_cancel_requested = False
+    dlg._task_running = False
+    dlg._task_cancel_requested = False
 
-    training_window.grid_rowconfigure(0, weight=1)
-    training_window.grid_columnconfigure(0, weight=1)
-    training_window.grid_columnconfigure(1, weight=1)
+    def _training_close_event(event):
+        if getattr(dlg, '_training_running', False) or getattr(dlg, '_task_running', False):
+            reply = QMessageBox.question(
+                dlg,
+                "An operation is still running",
+                "A training operation is still running. Abort it and close this window?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                dlg._training_cancel_requested = True
+                dlg._task_cancel_requested = True
+                event.accept()
+                return
+            event.ignore()
+            return
+        event.accept()
 
-    container_frame = tk.Frame(training_window)
-    container_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-    container_frame.grid_rowconfigure(0, weight=1)
-    container_frame.grid_columnconfigure(0, weight=1)
-    container_frame.grid_columnconfigure(1, weight=1)
+    dlg.closeEvent = _training_close_event
 
-    # Left frame for Segmentation Network
-    left_frame = tk.Frame(container_frame)
-    left_frame.grid(row=0, column=0, sticky="nsew", padx=10)
-    left_frame.grid_rowconfigure(99, weight=1)
-    left_frame.grid_columnconfigure(0, weight=1)
-    left_frame.grid_columnconfigure(1, weight=1)
+    root = QVBoxLayout(dlg)
+    root.setContentsMargins(8, 8, 8, 8)
+    panels = QHBoxLayout()
+    panels.setAlignment(Qt.AlignmentFlag.AlignTop)
+    root.addLayout(panels, stretch=1)
+
+    # ---- Left: Segmentation ----
+    left = QGridLayout()
+    left_w = QWidget()
+    left_w.setLayout(left)
+    left_w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    panels.addWidget(left_w, stretch=1, alignment=Qt.AlignmentFlag.AlignTop)
 
     row = 0
-    tk.Label(left_frame, text="Segmentation Network", font=("Arial", 16)).grid(row=row, column=0, columnspan=2, pady=10, sticky="nsew")
+    left.addWidget(QLabel("<b style='font-size:16px'>Segmentation Network</b>"), row, 0, 1, 2,
+                   Qt.AlignmentFlag.AlignCenter)
     row += 1
 
-    def update_batch_combobox_segment():
-        app_state.update_batch_select_combobox_segment(select_path=selection_var_segmentation.get())
-
-    use_selected_files_var = tk.BooleanVar()
-    tk.Checkbutton(left_frame, text="Use segmented files only", variable=use_selected_files_var).grid(row=row, column=0, columnspan=2, sticky="w")
+    use_seg_only = QCheckBox("Use segmented files only")
+    left.addWidget(use_seg_only, row, 0, 1, 2)
     row += 1
 
-    # Radio buttons for selection
-    selection_var_segmentation = tk.StringVar(value="current_day")
-    tk.Radiobutton(left_frame, text="Current Day", variable=selection_var_segmentation, value="current_day",
-                   command=update_batch_combobox_segment).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(left_frame, text="Current Experiment", variable=selection_var_segmentation, value="current_experiment",
-                   command=update_batch_combobox_segment).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(left_frame, text="Current Bird", variable=selection_var_segmentation, value="current_bird",
-                   command=update_batch_combobox_segment).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    
-    # Combobox for batch file selection
-    batch_file_var = tk.StringVar()
-    training_batch_combobox_segmentation = ttk.Combobox(left_frame,textvariable=batch_file_var)
-    training_batch_combobox_segmentation.set("Select Batch File")
-    app_state.training_window.training_batch_combobox_segmentation = training_batch_combobox_segmentation
-    app_state.update_batch_select_combobox_segment(select_path = selection_var_segmentation.get())
-    training_batch_combobox_segmentation.grid(row=2, column=1, sticky="ew")
+    seg_sel = Var("current_day")
+    seg_grp = QButtonGroup(dlg)
+    for txt, val in [("Current Day", "current_day"), ("Current Experiment", "current_experiment"),
+                     ("Current Bird", "current_bird")]:
+        rb = QRadioButton(txt)
+        seg_grp.addButton(rb)
+        if val == "current_day":
+            rb.setChecked(True)
 
-    tk.Label(left_frame, text="Training Dataset Name: ").grid(row=row, column=0, sticky="w")
-    dataset_name_entry = tk.Entry(left_frame)
-    dataset_name_entry.grid(row=row, column=1, sticky="ew")
-    dataset_name_entry.insert(0, "edit_seg_dataset_name")
-    row += 1
+        def _mc(v=val):
+            return lambda: (seg_sel.set(v), app_state.update_batch_select_combobox_segment(v))
 
-    tk.Label(left_frame, text="Chunk Size: ").grid(row=row, column=0, sticky="w")
-    chunk_size_entry = tk.Entry(left_frame, textvariable=app_state.train_segmentation_params['chunk_size'])
-    chunk_size_entry.grid(row=row, column=1, sticky="ew")
+        rb.toggled.connect(lambda chk, cb=_mc(): cb() if chk else None)
+        left.addWidget(rb, row, 0, 1, 2)
+        row += 1
+
+    seg_batch = QComboBox()
+    seg_batch.addItem("Select Batch File")
+    dlg.training_batch_combobox_segmentation = seg_batch
+    app_state.update_batch_select_combobox_segment(seg_sel.get())
+    left.addWidget(seg_batch, 3, 1)
+
+    left.addWidget(QLabel("Training Dataset Name:"), row, 0)
+    seg_ds_name = QLineEdit("edit_seg_dataset_name")
+    left.addWidget(seg_ds_name, row, 1)
     row += 1
 
-    tk.Label(left_frame, text="Hist Size: ").grid(row=row, column=0, sticky="w")
-    hist_size_entry = tk.Entry(left_frame, textvariable=app_state.train_segmentation_params['hist_size'])
-    hist_size_entry.grid(row=row, column=1, sticky="ew")
+    left.addWidget(QLabel("Chunk Size:"), row, 0)
+    seg_chunk = QLineEdit(app_state.train_segmentation_params['chunk_size'].get())
+    left.addWidget(seg_chunk, row, 1)
     row += 1
 
-    tk.Checkbutton(left_frame, text="Overlap chunks", variable=app_state.train_segmentation_params['overlap_chunks']).grid(row=row, column=0, sticky="w")
+    left.addWidget(QLabel("Hist Size:"), row, 0)
+    seg_hist = QLineEdit(app_state.train_segmentation_params['hist_size'].get())
+    left.addWidget(seg_hist, row, 1)
     row += 1
 
-    tk.Button(
-        left_frame, text="Create Training Dataset",
-        command=lambda: start_create_segmentation_training_dataset(
-            app_state, dataset_name_entry.get(), use_selected_files_var.get(), selection_var_segmentation.get(), batch_file_var.get(), bird_combobox, experiment_combobox, day_combobox, root
-        )
-    ).grid(row=row, column=0, columnspan=2, sticky="ew")
+    seg_overlap = QCheckBox("Overlap chunks")
+    seg_overlap.setChecked(app_state.train_segmentation_params['overlap_chunks'].get())
+    left.addWidget(seg_overlap, row, 0, 1, 2)
     row += 1
 
-    tk.Label(left_frame, text="").grid(row=row, column=0, columnspan=2)
+    def _create_seg_ds():
+        if getattr(dlg, '_training_running', False) or getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A training operation is already running.")
+            return
+        app_state.train_segmentation_params['chunk_size'].set(seg_chunk.text())
+        app_state.train_segmentation_params['hist_size'].set(seg_hist.text())
+        app_state.train_segmentation_params['overlap_chunks'].set(seg_overlap.isChecked())
+        b, e, d = _get_bird_exp_day(app_state)
+        start_create_segmentation_training_dataset(
+            app_state, seg_ds_name.text(), use_seg_only.isChecked(),
+            seg_sel.get(), seg_batch.currentText(), b, e, d, dlg)
+
+    btn_create_seg = _btn("Create Training Dataset", _create_seg_ds)
+    left.addWidget(btn_create_seg, row, 0, 1, 2)
     row += 1
 
-    training_dataset_var = tk.StringVar()
-    training_dataset_combobox = ttk.Combobox(left_frame, textvariable=training_dataset_var)
-    training_dataset_combobox.set("Select Training Dataset")
-    app_state.training_window.training_dataset_combobox_segmentation = training_dataset_combobox
+    left.addWidget(QLabel(""), row, 0)
+    row += 1
+
+    seg_ds_combo = QComboBox()
+    seg_ds_combo.addItem("Select Training Dataset")
+    dlg.training_dataset_combobox_segmentation = seg_ds_combo
     app_state.update_segmentation_datasets_combobox()
-    training_dataset_combobox.grid(row=row, column=0, columnspan=2, sticky="ew")
+    left.addWidget(seg_ds_combo, row, 0, 1, 2)
     row += 1
 
-    checkbox_frame_segmentation = tk.Frame(left_frame)
-    checkbox_frame_segmentation.grid(row=row, column=0, columnspan=2, sticky="w")
-    tk.Checkbutton(checkbox_frame_segmentation, text="Downsampling", variable=app_state.train_segmentation_params['downsampling']).grid(row=0, column=0, sticky="w")
-    #tk.Checkbutton(checkbox_frame_segmentation, text="QAT", variable=app_state.train_segmentation_params['qat']).grid(row=0, column=2, sticky="w") # optional for further usage
+    seg_imbalance_grp = QButtonGroup(dlg)
+    seg_rb_none = QRadioButton("None")
+    seg_rb_down = QRadioButton("Downsampling")
+    seg_rb_weighted = QRadioButton("Weighted BCE")
+    for rb in [seg_rb_none, seg_rb_down, seg_rb_weighted]:
+        seg_imbalance_grp.addButton(rb)
+    _seg_strat = app_state.train_segmentation_params['imbalance_strategy'].get()
+    if _seg_strat == 'none':
+        seg_rb_none.setChecked(True)
+    elif _seg_strat == 'weighted_loss':
+        seg_rb_weighted.setChecked(True)
+    else:
+        seg_rb_down.setChecked(True)
+    seg_imbalance_row = QWidget()
+    seg_imbalance_layout = QHBoxLayout(seg_imbalance_row)
+    seg_imbalance_layout.setContentsMargins(0, 0, 0, 0)
+    for rb in [seg_rb_none, seg_rb_down, seg_rb_weighted]:
+        seg_imbalance_layout.addWidget(rb)
+    left.addWidget(seg_imbalance_row, row, 0, 1, 2)
     row += 1
 
-    segmentation_params = [
-        ("Epochs:", 'epochs'),
-        ("Batch Size:", 'batch_size'),
-        ("Learning Rate:", 'learning_rate'),
-        ("Early Stopping Patience:", 'early_stopping_patience'),
-    ]
-
-    for label_text, param_key in segmentation_params:
-        tk.Label(left_frame, text=label_text).grid(row=row, column=0, sticky="w")
-        tk.Entry(left_frame, textvariable=app_state.train_segmentation_params[param_key]).grid(row=row, column=1, sticky="ew")
+    seg_t_entries = {}
+    for lbl, key in [("Epochs:", 'epochs'), ("Batch Size:", 'batch_size'),
+                     ("Learning Rate:", 'learning_rate'), ("Early Stopping Patience:", 'early_stopping_patience')]:
+        left.addWidget(QLabel(lbl), row, 0)
+        e = QLineEdit(app_state.train_segmentation_params[key].get())
+        seg_t_entries[key] = e
+        left.addWidget(e, row, 1)
         row += 1
 
-    tk.Button(
-        left_frame, text="Start Training",
-        command=lambda: start_segmentation_training(root, app_state, training_dataset_var.get())
-    ).grid(row=row, column=0, columnspan=2, sticky="ew")
+    def _train_seg():
+        if getattr(dlg, '_training_running', False) or getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A training operation is already running.")
+            return
+        if seg_rb_none.isChecked():
+            _strat = 'none'
+        elif seg_rb_weighted.isChecked():
+            _strat = 'weighted_loss'
+        else:
+            _strat = 'downsampling'
+        app_state.train_segmentation_params['imbalance_strategy'].set(_strat)
+        for k, e in seg_t_entries.items():
+            app_state.train_segmentation_params[k].set(e.text())
+        start_segmentation_training(dlg, app_state, seg_ds_combo.currentText())
 
-    # Right frame for Classification Network
-    right_frame = tk.Frame(container_frame)
-    right_frame.grid(row=0, column=1, sticky="nsew", padx=10)
-    right_frame.grid_rowconfigure(99, weight=1)
-    right_frame.grid_columnconfigure(0, weight=1)
-    right_frame.grid_columnconfigure(1, weight=1)
+    btn_train_seg = _btn("Start Training", _train_seg)
+    left.addWidget(btn_train_seg, row, 0, 1, 2)
+
+    # ---- Right: Classification ----
+    right = QGridLayout()
+    right_w = QWidget()
+    right_w.setLayout(right)
+    right_w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    panels.addWidget(right_w, stretch=1, alignment=Qt.AlignmentFlag.AlignTop)
 
     row = 0
-    tk.Label(right_frame, text="Classification Network", font=("Arial", 16)).grid(row=row, column=0, columnspan=2, pady=10, sticky="nsew")
+    right.addWidget(QLabel("<b style='font-size:16px'>Classification Network</b>"), row, 0, 1, 2,
+                    Qt.AlignmentFlag.AlignCenter)
     row += 1
 
-    def update_batch_combobox_class():
-        app_state.update_batch_select_combobox_class(select_path=selection_var_classification.get())
-
-    use_selected_files_var_classification = tk.BooleanVar()
-    tk.Checkbutton(right_frame, text="Use classified files only", variable=use_selected_files_var_classification).grid(row=row, column=0, columnspan=2, sticky="w")
+    use_class_only = QCheckBox("Use classified files only")
+    right.addWidget(use_class_only, row, 0, 1, 2)
     row += 1
 
-    # Radio buttons for selection
-    selection_var_classification = tk.StringVar(value="current_day")
-    tk.Radiobutton(right_frame, text="Current Day", variable=selection_var_classification, value="current_day", 
-                   command=update_batch_combobox_class).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(right_frame, text="Current Experiment", variable=selection_var_classification, value="current_experiment",
-                   command=update_batch_combobox_class).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    tk.Radiobutton(right_frame, text="Current Bird", variable=selection_var_classification, value="current_bird",
-                   command=update_batch_combobox_class).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
+    cls_sel = Var("current_day")
+    cls_grp = QButtonGroup(dlg)
+    for txt, val in [("Current Day", "current_day"), ("Current Experiment", "current_experiment"),
+                     ("Current Bird", "current_bird")]:
+        rb = QRadioButton(txt)
+        cls_grp.addButton(rb)
+        if val == "current_day":
+            rb.setChecked(True)
 
-    # Combobox for batch file selection
-    batch_file_var = tk.StringVar()
-    training_batch_combobox_classification = ttk.Combobox(right_frame,textvariable=batch_file_var)
-    training_batch_combobox_classification.set("Select Batch File")
-    app_state.training_window.training_batch_combobox_classification = training_batch_combobox_classification
-    app_state.update_batch_select_combobox_class(select_path = selection_var_classification.get())
-    training_batch_combobox_classification.grid(row=2, column=1, sticky="ew")
+        def _mc(v=val):
+            return lambda: (cls_sel.set(v), app_state.update_batch_select_combobox_class(v))
 
-    tk.Label(right_frame, text="Training Dataset Name:").grid(row=row, column=0, sticky="w")
-    dataset_name_entry_classification = tk.Entry(right_frame)
-    dataset_name_entry_classification.grid(row=row, column=1, sticky="ew")
-    dataset_name_entry_classification.insert(0, "edit_class_dataset_name")
-    row += 1
-
-    spec_params = [
-        ("N Input Chunks / Size:", 'input_length'),
-        ("Nperseg:", 'nperseg'),
-        ("Noverlap:", 'noverlap'),
-        ("NFFT:", 'nfft'),
-        ("Frequency Cutoffs:", 'freq_cutoffs'),
-    ]
-
-    for label_text, param_key in spec_params:
-        tk.Label(right_frame, text=label_text).grid(row=row, column=0, sticky="w")
-        tk.Entry(right_frame, textvariable=app_state.spec_params[param_key]).grid(row=row, column=1, sticky="ew")
+        rb.toggled.connect(lambda chk, cb=_mc(): cb() if chk else None)
+        right.addWidget(rb, row, 0, 1, 2)
         row += 1
 
-    tk.Button(
-        right_frame, text="Create Training Dataset",
-        command=lambda: start_create_classification_training_dataset(
-            app_state, dataset_name_entry_classification.get(), use_selected_files_var_classification.get(), selection_var_classification.get(), batch_file_var.get(), bird_combobox, experiment_combobox, day_combobox, root
-        )
-    ).grid(row=row, column=0, columnspan=2, sticky="ew")
+    cls_batch = QComboBox()
+    cls_batch.addItem("Select Batch File")
+    dlg.training_batch_combobox_classification = cls_batch
+    app_state.update_batch_select_combobox_class(cls_sel.get())
+    right.addWidget(cls_batch, 3, 1)
+
+    right.addWidget(QLabel("Training Dataset Name:"), row, 0)
+    cls_ds_name = QLineEdit("edit_class_dataset_name")
+    right.addWidget(cls_ds_name, row, 1)
     row += 1
 
-    tk.Label(right_frame, text="").grid(row=row, column=0, columnspan=2)
+    spec_entries = {}
+    for lbl, key in [("N Input Chunks / Size:", 'input_length'), ("Nperseg:", 'nperseg'),
+                     ("Noverlap:", 'noverlap'), ("NFFT:", 'nfft'), ("Frequency Cutoffs:", 'freq_cutoffs')]:
+        right.addWidget(QLabel(lbl), row, 0)
+        e = QLineEdit(app_state.spec_params[key].get())
+        spec_entries[key] = e
+        right.addWidget(e, row, 1)
+        row += 1
+
+    def _create_cls_ds():
+        if getattr(dlg, '_training_running', False) or getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A training operation is already running.")
+            return
+        for k, e in spec_entries.items():
+            app_state.spec_params[k].set(e.text())
+        b, e, d = _get_bird_exp_day(app_state)
+        start_create_classification_training_dataset(
+            app_state, cls_ds_name.text(), use_class_only.isChecked(),
+            cls_sel.get(), cls_batch.currentText(), b, e, d, dlg)
+
+    btn_create_cls = _btn("Create Training Dataset", _create_cls_ds)
+    right.addWidget(btn_create_cls, row, 0, 1, 2)
     row += 1
 
-    training_dataset_var_classification = tk.StringVar()
-    training_dataset_combobox_classification = ttk.Combobox(right_frame, textvariable=training_dataset_var_classification)
-    training_dataset_combobox_classification.set("Select Training Dataset")
-    app_state.training_window.training_dataset_combobox_classification = training_dataset_combobox_classification
+    right.addWidget(QLabel(""), row, 0)
+    row += 1
+
+    cls_ds_combo = QComboBox()
+    cls_ds_combo.addItem("Select Training Dataset")
+    dlg.training_dataset_combobox_classification = cls_ds_combo
     app_state.update_classification_datasets_combobox()
-    training_dataset_combobox_classification.grid(row=row, column=0, columnspan=2, sticky="ew")
+    right.addWidget(cls_ds_combo, row, 0, 1, 2)
     row += 1
 
-    checkbox_frame_classification = tk.Frame(right_frame)
-    checkbox_frame_classification.grid(row=row, column=0, columnspan=2, sticky="w")
-    tk.Checkbutton(checkbox_frame_classification, text="Downsampling", variable=app_state.train_classification_params['downsampling']).grid(row=0, column=0, sticky="w")
-    #tk.Checkbutton(checkbox_frame_classification, text="QAT", variable=app_state.train_classification_params['qat']).grid(row=0, column=2, sticky="w") # make invisible for now
+    cls_imbalance_grp = QButtonGroup(dlg)
+    cls_rb_none = QRadioButton("None")
+    cls_rb_down = QRadioButton("Downsampling")
+    cls_rb_weighted = QRadioButton("Weighted Loss")
+    for rb in [cls_rb_none, cls_rb_down, cls_rb_weighted]:
+        cls_imbalance_grp.addButton(rb)
+    _cls_strat = app_state.train_classification_params['imbalance_strategy'].get()
+    if _cls_strat == 'none':
+        cls_rb_none.setChecked(True)
+    elif _cls_strat == 'weighted_loss':
+        cls_rb_weighted.setChecked(True)
+    else:
+        cls_rb_down.setChecked(True)
+    cls_down_row = QHBoxLayout()
+    for rb in [cls_rb_none, cls_rb_down, cls_rb_weighted]:
+        cls_down_row.addWidget(rb)
+
+    def _open_augmentation_settings():
+        aug = app_state.augmentation_params
+        adlg = QDialog(dlg)
+        adlg.setWindowTitle("Data Augmentation Settings")
+        adlg.resize(360, 280)
+        _set_dlg_icon(adlg)
+        form = QGridLayout(adlg)
+        r = 0
+
+        aug_enabled = QCheckBox("Enable augmentation during training")
+        aug_enabled.setChecked(aug['enabled'].get())
+        form.addWidget(aug_enabled, r, 0, 1, 2)
+        r += 1
+
+        entries = {}
+        for lbl, key in [("Probability (0-1):", 'probability'),
+                         ("Noise Level:", 'noise_level'),
+                         ("Freq Mask Width:", 'freq_mask_width'),
+                         ("Time Mask Width:", 'time_mask_width'),
+                         ("Compression Factor:", 'compression_factor')]:
+            form.addWidget(QLabel(lbl), r, 0)
+            e = QLineEdit(aug[key].get())
+            entries[key] = e
+            form.addWidget(e, r, 1)
+            r += 1
+
+        def _apply():
+            aug['enabled'].set(aug_enabled.isChecked())
+            for k, e in entries.items():
+                aug[k].set(e.text())
+            adlg.accept()
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(_btn("OK", _apply))
+        btn_row.addWidget(_btn("Cancel", adlg.reject))
+        form.addLayout(btn_row, r, 0, 1, 2)
+        adlg.exec()
+
+    btn_aug = _btn("Augmentation...", _open_augmentation_settings)
+    cls_down_row.addWidget(btn_aug)
+    right.addLayout(cls_down_row, row, 0, 1, 2)
     row += 1
 
-    classification_params = [
-        ("Epochs:", 'epochs'),
-        ("Batch Size:", 'batch_size'),
-        ("Learning Rate:", 'learning_rate'),
-        ("Early Stopping Patience:", 'early_stopping_patience'),
-    ]
-
-    for label_text, param_key in classification_params:
-        tk.Label(right_frame, text=label_text).grid(row=row, column=0, sticky="w")
-        tk.Entry(right_frame, textvariable=app_state.train_classification_params[param_key]).grid(row=row, column=1, sticky="ew")
+    cls_t_entries = {}
+    for lbl, key in [("Epochs:", 'epochs'), ("Batch Size:", 'batch_size'),
+                     ("Learning Rate:", 'learning_rate'), ("Early Stopping Patience:", 'early_stopping_patience')]:
+        right.addWidget(QLabel(lbl), row, 0)
+        e = QLineEdit(app_state.train_classification_params[key].get())
+        cls_t_entries[key] = e
+        right.addWidget(e, row, 1)
         row += 1
 
-    tk.Button(
-        right_frame, text="Start Training",
-        command=lambda: start_classification_training(
-            root,
-            app_state,
-            training_dataset_var_classification.get(),
-            bird_combobox.get()
-        )
-    ).grid(row=row, column=0, columnspan=2, sticky="ew")
+    def _train_cls():
+        if getattr(dlg, '_training_running', False) or getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A training operation is already running.")
+            return
+        if cls_rb_none.isChecked():
+            _strat = 'none'
+        elif cls_rb_weighted.isChecked():
+            _strat = 'weighted_loss'
+        else:
+            _strat = 'downsampling'
+        app_state.train_classification_params['imbalance_strategy'].set(_strat)
+        for k, e in cls_t_entries.items():
+            app_state.train_classification_params[k].set(e.text())
+        b = app_state.bird_combobox.currentText() if app_state.bird_combobox else ""
+        start_classification_training(dlg, app_state, cls_ds_combo.currentText(), b)
 
-    # Adjust window size to content
-    training_window.update_idletasks()
-    training_window.minsize(training_window.winfo_reqwidth(), training_window.winfo_reqheight())
+    btn_train_cls = _btn("Start Training", _train_cls)
+    right.addWidget(btn_train_cls, row, 0, 1, 2)
+
+    # Shared status widgets
+    dlg.status_label = QLabel("")
+    dlg.status_label.setStyleSheet("color: green; font-size: 14px;")
+    dlg.status_label.hide()
+    dlg.progressbar = QProgressBar()
+    dlg.progressbar.hide()
+
+    root.addWidget(dlg.status_label)
+    root.addWidget(dlg.progressbar)
+
+    dlg.show()
 
 
-def open_cluster_window(root, app_state, bird_combobox, experiment_combobox, day_combobox):
-    """Open the cluster window for obtaining labels via clustering."""
-    from moove.utils import start_create_cluster_dataset_thread, start_clustering_thread, start_dash_app_thread, replace_labels_from_df, stop_dash_app_thread, remove_pkl_suffix
+# ======================================================================
+# Cluster Dialog
+# ======================================================================
+def open_cluster_window(parent, app_state):
+    from moove.utils import (
+        start_create_cluster_dataset_thread, start_clustering_thread,
+        start_dash_app_thread, replace_labels_from_df, stop_dash_app_thread,
+        remove_pkl_suffix,
+    )
 
-    cluster_window = tk.Toplevel(root)
-    cluster_window.title("Cluster")
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Cluster")
+    dlg.resize(400, 580)
+    _set_dlg_icon(dlg)
+    app_state.cluster_window = dlg
+    dlg._task_running = False
+    dlg._task_cancel_requested = False
 
-    cluster_window.geometry("400x565")
-    cluster_window.grid_rowconfigure(0, weight=1)
-    cluster_window.grid_columnconfigure(0, weight=1)
-    # ensure the window stays in front
-    cluster_window.transient(root)
+    def _cluster_close_event(event):
+        if getattr(dlg, '_task_running', False):
+            reply = QMessageBox.question(
+                dlg,
+                "Cluster operation is still running",
+                "A cluster operation is still running. Abort it and close this window?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                dlg._task_cancel_requested = True
+                event.accept()
+                return
+            event.ignore()
+            return
+        event.accept()
 
-    app_state.cluster_window = cluster_window
+    dlg.closeEvent = _cluster_close_event
 
-    container_frame = tk.Frame(cluster_window)
-    container_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
-    container_frame.grid_columnconfigure(0, weight=1)
+    outer = QVBoxLayout(dlg)
+    outer.setContentsMargins(8, 8, 8, 8)
+    grid = QGridLayout()
+    outer.addLayout(grid)
+    outer.addStretch()
+    row = 0
+    grid.addWidget(QLabel("<b style='font-size:16px'>Cluster Operations</b>"), row, 0, 1, 2,
+                   Qt.AlignmentFlag.AlignCenter)
+    row += 1
 
-    row_num = 0
-    tk.Label(container_frame, text="Cluster Operations", font=("Arial", 16)).grid(row=row_num, column=0, columnspan=2, pady=10, sticky="ew")
-    row_num += 1
+    use_seg = QCheckBox("Use segmented files only")
+    grid.addWidget(use_seg, row, 0, 1, 2)
+    row += 1
 
-    def update_batch_combobox_cluster():
-        app_state.update_batch_select_combobox_cluster(select_path=selection_var.get())
+    sel = Var("current_day")
+    grp = QButtonGroup(dlg)
+    for txt, val in [("Current Day", "current_day"), ("Current Experiment", "current_experiment"),
+                     ("Current Bird", "current_bird")]:
+        rb = QRadioButton(txt)
+        grp.addButton(rb)
+        if val == "current_day":
+            rb.setChecked(True)
 
-    # CheckBox for "Use selected files only"
-    use_selected_files_var = tk.BooleanVar()
-    tk.Checkbutton(container_frame, text="Use segmented files only", variable=use_selected_files_var).grid(row=row_num, column=0, sticky="w")
-    row_num += 1
+        def _mc(v=val):
+            return lambda: (sel.set(v), app_state.update_batch_select_combobox_cluster(v))
 
-    # Radio buttons for selection
-    selection_var = tk.StringVar(value="current_day")
-    tk.Radiobutton(container_frame, text="Current Day", variable=selection_var, value="current_day",
-                   command=update_batch_combobox_cluster).grid(row=row_num, column=0, sticky="w")
-    row_num += 1
-    tk.Radiobutton(container_frame, text="Current Experiment", variable=selection_var, value="current_experiment",
-                   command=update_batch_combobox_cluster).grid(row=row_num, column=0, sticky="w")
-    row_num += 1
-    tk.Radiobutton(container_frame, text="Current Bird", variable=selection_var, value="current_bird",
-                   command=update_batch_combobox_cluster).grid(row=row_num, column=0, sticky="w")
-    row_num += 1
+        rb.toggled.connect(lambda chk, cb=_mc(): cb() if chk else None)
+        grid.addWidget(rb, row, 0)
+        row += 1
 
-    # Combobox for batch file selection
-    batch_file_var = tk.StringVar()
-    cluster_batch_combobox = ttk.Combobox(container_frame,textvariable=batch_file_var)
-    cluster_batch_combobox.set("Select Batch File")
-    app_state.cluster_window.cluster_batch_combobox = cluster_batch_combobox
-    app_state.update_batch_select_combobox_cluster(select_path = selection_var.get())
-    cluster_batch_combobox.grid(row=2, column=1, sticky="ew")
+    batch_combo = QComboBox()
+    batch_combo.addItem("Select Batch File")
+    dlg.cluster_batch_combobox = batch_combo
+    app_state.update_batch_select_combobox_cluster(sel.get())
+    grid.addWidget(batch_combo, 3, 1)
 
-    # Entry for cluster dataset name
-    tk.Label(container_frame, text="Cluster Dataset Name:").grid(row=row_num, column=0, sticky="w")
-    dataset_name_entry = tk.Entry(container_frame)
-    dataset_name_entry.grid(row=row_num, column=1, sticky="ew")
-    dataset_name_entry.insert(0, "edit_cluster_dataset_name")
-    row_num += 1
+    grid.addWidget(QLabel("Cluster Dataset Name:"), row, 0)
+    ds_name = QLineEdit("edit_cluster_dataset_name")
+    grid.addWidget(ds_name, row, 1)
+    row += 1
 
-    spec_params = [
-        ("Nperseg:", 'nperseg'),
-        ("Noverlap:", 'noverlap'),
-        ("NFFT:", 'nfft'),
-        ("Frequency Cutoffs:", 'freq_cutoffs'),
-    ]
+    spec_entries = {}
+    for lbl, key in [("Nperseg:", 'nperseg'), ("Noverlap:", 'noverlap'),
+                     ("NFFT:", 'nfft'), ("Frequency Cutoffs:", 'freq_cutoffs')]:
+        grid.addWidget(QLabel(lbl), row, 0)
+        e = QLineEdit(app_state.spec_params[key].get())
+        spec_entries[key] = e
+        grid.addWidget(e, row, 1)
+        row += 1
 
-    for label_text, param_key in spec_params:
-        tk.Label(container_frame, text=label_text).grid(row=row_num, column=0, sticky="w")
-        tk.Entry(container_frame, textvariable=app_state.spec_params[param_key]).grid(row=row_num, column=1, sticky="ew")
-        row_num += 1
+    def _create_ds():
+        if getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A cluster job is already running.")
+            return
+        for k, e in spec_entries.items():
+            app_state.spec_params[k].set(e.text())
+        b, e, d = _get_bird_exp_day(app_state)
+        start_create_cluster_dataset_thread(app_state, ds_name.text(), use_seg.isChecked(),
+                                            sel.get(), batch_combo.currentText(), b, e, d, dlg)
 
-    # Button to create cluster dataset
-    tk.Button(
-        container_frame, text="Create Cluster Dataset",
-        command=lambda: start_create_cluster_dataset_thread(app_state, dataset_name_entry.get(), use_selected_files_var.get(), selection_var.get(), batch_file_var.get(), bird_combobox, experiment_combobox, day_combobox, root)
-    ).grid(row=row_num, column=0, columnspan=2, pady=(10, 0), sticky="ew")
-    row_num += 1
+    btn_create = _btn("Create Cluster Dataset", _create_ds)
+    grid.addWidget(btn_create, row, 0, 1, 2)
+    row += 1
 
-    tk.Label(container_frame, text="").grid(row=row_num, column=0, columnspan=2)
-    row_num += 1
+    grid.addWidget(QLabel(""), row, 0)
+    row += 1
 
-    # ComboBox for selecting the cluster dataset
-    cluster_dataset_var = tk.StringVar()
-    cluster_dataset_combobox = ttk.Combobox(container_frame, textvariable=cluster_dataset_var)
-    cluster_dataset_combobox.grid(row=row_num, column=0, columnspan=2, sticky="ew")
-    cluster_dataset_combobox.set("Select Cluster Dataset")
-    app_state.cluster_window.cluster_dataset_combobox = cluster_dataset_combobox
+    clus_combo = QComboBox()
+    clus_combo.addItem("Select Cluster Dataset")
+    dlg.cluster_dataset_combobox = clus_combo
     app_state.update_cluster_datasets_combobox()
-    row_num += 1
+    grid.addWidget(clus_combo, row, 0, 1, 2)
+    row += 1
 
-    umap_k_means_params = [
-        ("N_neighbors:", 'n_neighbors'),
-        ("Min_dist:", 'min_dist'),
-        ("N Syllables:", 'n_clusters'),
-    ]
+    umap_entries = {}
+    for lbl, key in [("N_neighbors:", 'n_neighbors'), ("Min_dist:", 'min_dist'),
+                     ("N Syllables:", 'n_clusters')]:
+        grid.addWidget(QLabel(lbl), row, 0)
+        e = QLineEdit(app_state.umap_k_means_params[key].get())
+        umap_entries[key] = e
+        grid.addWidget(e, row, 1)
+        row += 1
 
-    for label_text, param_key in umap_k_means_params:
-        tk.Label(container_frame, text=label_text).grid(row=row_num, column=0, sticky="w")
-        tk.Entry(container_frame, textvariable=app_state.umap_k_means_params[param_key]).grid(row=row_num, column=1, sticky="ew")
-        row_num += 1
+    def _cluster():
+        if getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A cluster job is already running.")
+            return
+        for k, e in umap_entries.items():
+            app_state.umap_k_means_params[k].set(e.text())
+        start_clustering_thread(dlg, app_state, remove_pkl_suffix(clus_combo.currentText()))
 
-    # Button to start clustering
-    tk.Button(
-        container_frame, text="Cluster Syllables",
-        command=lambda: start_clustering_thread(root, app_state, remove_pkl_suffix(cluster_dataset_var.get()))
-    ).grid(row=row_num, column=0, columnspan=2, pady=(10, 0), sticky="ew")
-    row_num += 1
+    btn_cluster = _btn("Cluster Syllables", _cluster)
+    grid.addWidget(btn_cluster, row, 0, 1, 2)
+    row += 1
 
-    # Button to open Dash GUI
-    tk.Button(
-        container_frame, text="Open Dash GUI",
-        command=lambda: start_dash_app_thread(app_state, remove_pkl_suffix(cluster_dataset_var.get()))
-    ).grid(row=row_num, column=0, pady=(10, 0), sticky="ew")
+    btn_dash = _btn("Open Dash GUI",
+                    lambda: start_dash_app_thread(app_state, remove_pkl_suffix(clus_combo.currentText())))
+    grid.addWidget(btn_dash, row, 0)
 
-    # Button to close Dash GUI
-    tk.Button(
-        container_frame, text="Close Dash GUI",
-        command=lambda: stop_dash_app_thread(app_state)
-    ).grid(row=row_num, column=1, pady=(10, 0), sticky="ew")
+    btn_close_dash = _btn("Close Dash GUI",
+                          lambda: stop_dash_app_thread(app_state))
+    grid.addWidget(btn_close_dash, row, 1)
+    row += 1
 
-    row_num += 1
+    def _replace_labels():
+        if getattr(dlg, '_task_running', False):
+            show_info(dlg, "Info", "A cluster job is already running.")
+            return
+        replace_labels_from_df(app_state, remove_pkl_suffix(clus_combo.currentText()), dlg)
 
-    # Button to replace labels
-    tk.Button(
-        container_frame, text="Replace Labels",
-        command=lambda: replace_labels_from_df(app_state, remove_pkl_suffix(cluster_dataset_var.get()), root)
-    ).grid(row=row_num, column=0, columnspan=2, pady=(10, 0), sticky="ew")
+    btn_replace = _btn("Replace Labels", _replace_labels)
+    grid.addWidget(btn_replace, row, 0, 1, 2)
+    row += 1
 
-    # Adjust window size to content
-    cluster_window.update_idletasks()
-    cluster_window.minsize(cluster_window.winfo_reqwidth(), cluster_window.winfo_reqheight())
+    dlg.status_label = QLabel("")
+    dlg.status_label.setStyleSheet("color: green; font-size: 14px;")
+    dlg.status_label.hide()
+    dlg.progressbar = QProgressBar()
+    dlg.progressbar.hide()
+    outer.addWidget(dlg.status_label)
+    outer.addWidget(dlg.progressbar)
+
+    dlg.show()

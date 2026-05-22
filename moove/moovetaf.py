@@ -1,3 +1,7 @@
+# important first import
+import torch
+import torch.nn.functional as F
+
 import os
 import re
 import sys
@@ -12,12 +16,11 @@ import time
 import shutil
 import sounddevice as sd
 from scipy.signal import lfilter, butter, lfilter_zi, spectrogram
-from scipy.ndimage.filters import uniform_filter1d
+from scipy.ndimage import uniform_filter1d
 from scipy.io import wavfile
-from jinja2 import Template
 from pathlib import Path
-from moove.utils.movefuncs_utils import save_notmat
-from moove import templates
+from moove.utils.movefuncs_utils import save_notmat, save_recfile
+from moove.utils.training_utils import _load_checkpoint_with_version_fallback
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -52,7 +55,6 @@ os.makedirs(os.path.join(global_dir, "rec_data"), exist_ok=True)
 os.makedirs(os.path.join(global_dir, "playbacks"), exist_ok=True)
 
 # Variables needed regardless of realtime_classification
-# mooeve_config readout
 # section TAF
 bird_name = config.get('TAF', 'bird_name')
 experiment_name = config.get('TAF', 'experiment_name')
@@ -62,7 +64,7 @@ t_before = float(config.get('TAF', 't_before'))  # in seconds
 t_after = float(config.get('TAF', 't_after'))  # in seconds
 min_bout_duration = float(config.get('TAF', 'min_bout_duration'))
 memory_cleanup_interval = int(config.get('TAF', 'memory_cleanup_interval'))
-# Parse input channel configuration (supports single channel or comma-separated channels)
+# input channel
 input_channel_str = config.get('TAF', 'input_channel')
 if ',' in input_channel_str:
     config_input_channel = [int(x.strip()) for x in input_channel_str.split(',')]
@@ -71,7 +73,6 @@ else:
 
 # section bird
 data_output_folder_path = os.path.join(global_dir, 'rec_data')
-# trained_models
 bout_threshold_db = int(config.get(bird_name, 'bout_threshold_db'))
 window_size = int(config.get(bird_name, 'window_size'))
 bandpass_lowcut = int(config.get(bird_name, 'bandpass_lowcut'))
@@ -92,10 +93,6 @@ min_silent_duration = float(config.get(bird_name, 'min_silent_duration'))
 min_syllable_length = float(config.get(bird_name, 'min_syllable_length'))
 
 if realtime_classification:
-    # Conditional imports
-    import torch
-    import torch.nn.functional as F
-
     # Load and initialize models
     seg_model_name = config.get(bird_name, 'segmentation_model_name')
     class_model_name = config.get(bird_name, 'classification_model_name')
@@ -115,7 +112,7 @@ if realtime_classification:
         targeted_sequence_list = None
 
 
-    # path to the playback stimuli that can be played
+    # path to playback stimuli
     playback_stim_path = os.path.expanduser(config.get(bird_name, 'playback_dir'))
     # Find all wav files in playback stim path
     if config.get(bird_name, 'computer_generated_white_noise') == 'True':
@@ -123,13 +120,12 @@ if realtime_classification:
     elif config.get(bird_name, 'computer_generated_white_noise') == 'False':
         computer_generated_white_noise = False
         playback_files = sorted(glob.glob(os.path.join(playback_stim_path, '*.wav')))
-        # Load all files into a dictionary: {filename: sound_wav (array), samplerate_PB (float)}
         playback_sounds = {}
         for wav_file in playback_files:
             samplerate_PB, sound_wav = wavfile.read(wav_file)
             playback_sounds[os.path.basename(wav_file)] = (sound_wav / np.max(sound_wav), samplerate_PB)
 
-    # get's path to models and the names of the models
+    # model paths
     model_dir_path = os.path.join(global_dir, "trained_models")
     # Remove file extension if present
     if seg_model_name.endswith('.pth'):
@@ -138,7 +134,7 @@ if realtime_classification:
         class_model_name = class_model_name[:-4]
 
     # Load segmentation model
-    checkpoint = torch.load(os.path.join(model_dir_path, f'{seg_model_name}.pth'))
+    checkpoint = _load_checkpoint_with_version_fallback(os.path.join(model_dir_path, f'{seg_model_name}.pth'))
     seg_model = checkpoint['model']
     metadata = checkpoint['metadata']
 
@@ -147,7 +143,7 @@ if realtime_classification:
     seg_model.eval()
 
     # Load classification model
-    checkpoint = torch.load(os.path.join(model_dir_path, f'{class_model_name}.pth'))
+    checkpoint = _load_checkpoint_with_version_fallback(os.path.join(model_dir_path, f'{class_model_name}.pth'))
     class_model = checkpoint['model']
     metadata.update(checkpoint['metadata'])
 
@@ -181,11 +177,9 @@ if realtime_classification:
     input_chunks = input_length
     seg_input_size = hist_size
 else:
-    # When realtime_classification is False, set variables to None or default values
     input_length = None
     input_chunks = None
     device = None
-    # Set variables that may be used in the code
     targeted_sequence = None
     targeted_sequence_list = None
     lowcut = None
@@ -376,31 +370,7 @@ def save_bout(raw_audio_chunks, bout_indexes_waited, bout_recdt, wn_recfile_dict
         'feedback_info': feedback_info,
     }
 
-    template_string = """File created: {{ file_created }}
-
-    begin rec = {{ begin_rec }} ms
-    trig time  = {{ trig_time }} ms
-    rec end = {{ rec_end }} ms
-
-ADFREQ = {{ adfreq }}
-Chans = {{ chans }}
-Samples = {{ samples }}
-Catch Song = {{ catch_song }}
-Hand Segmented = {{ hand_segmented }}
-Hand Classified = {{ hand_classified }}
-T Before = {{ t_before }}
-T After = {{ t_after }}
-Feedback information:
-{% for info in feedback_info %}
-{{ info[0] }} msec: {{ info[1] }}
-{%- endfor %}
-"""
-
-    template = Template(template_string)
-    output = template.render(template_vars)
-
-    with open(os.path.join(save_path, file_name.replace(".wav", ".rec")), "w") as file:
-        file.write(output)
+    save_recfile(os.path.join(save_path, file_name.replace(".wav", ".rec")), template_vars)
 
     logger.info("Recfile saved!")
 
@@ -599,8 +569,25 @@ def stream_callback(indata, outdata, frames, time_info, status):
         if smoothed_db > bout_threshold_db:
             bout_index2wait = int(seconds_to_index(t_after, chunk_size, frame_rate))
 
-        # Part where the file gets saved
         if bout_index2wait == 0:
+            # Before saving, drop incomplete trailing entries (e.g., onset without offset/label).
+            # This keeps not.mat arrays aligned and prevents one-extra-onset files.
+            while len(onsets) > len(offsets):
+                onsets.pop()
+                logger.debug("Dropped dangling onset before save")
+
+            while len(offsets) > len(onsets):
+                offsets.pop()
+                logger.debug("Dropped dangling offset before save")
+
+            complete_syllables = min(len(onsets), len(offsets), len(pred_syl_list))
+            while len(onsets) > complete_syllables:
+                onsets.pop()
+            while len(offsets) > complete_syllables:
+                offsets.pop()
+            while len(pred_syl_list) > complete_syllables:
+                pred_syl_list.pop()
+
             bout_data_to_save = raw_audio_chunks.copy()
             bout_indexes_waited_copy = bout_indexes_waited
             bout_rec_dt_copy = bout_recdt
@@ -622,7 +609,11 @@ def stream_callback(indata, outdata, frames, time_info, status):
             bout_indexes_waited = 0
             y_pred_list = y_pred_list[-n:] if realtime_classification else []
             onset_flag = False
+            class_flag = False
+            waited_class_time = 0
+            missing_y_pred_flag = False
             offset_pending = False
+            offset_detected_time = 0
             bout_flag = False
             pred_syl_list = []
             pred_syl_list_for_playback = []
@@ -683,19 +674,39 @@ def stream_callback(indata, outdata, frames, time_info, status):
                         len_offset = len(offsets)
                         len_ypred = len(pred_syl_list)
                         if last_duration < (min_syllable_length * 1000):
-                            # Remove the last onset, offset, and corresponding pred_syl_list entry
                             onsets.pop()
                             offsets.pop()
-                            # syllable list equals offset number
-                            if len_ypred == len_offset:
+                            if class_flag:
+                                # Short syllable is discarded while classification is pending.
+                                # Abort current classification to avoid adding a stale label.
+                                class_flag = False
+                                waited_class_time = 0
+                                offset_pending = False
+                                offset_detected_time = 0
+                                missing_y_pred_flag = False
+                                logger.debug("Discarded short syllable and aborted pending classification")
+                            elif len_ypred == len_offset:
                                 pred_syl_list.pop()
                                 pred_syl_list_for_playback.pop()
-                            # syllable list contains one entry less than offsets (missing syl)
                             elif len_ypred == (len_offset - 1):
-                                missing_y_pred_flag = True
-                                logger.debug("Missing Y_PRED_FLAG set to True")
+                                # No label exists yet for this discarded syllable.
+                                logger.debug("Discarded short syllable had no label to remove")
                             else:
-                                logger.error("Mismatch in lengths!")
+                                logger.warning(
+                                    "Mismatch detected during short-syllable discard; resyncing state "
+                                    "(onsets=%s offsets=%s labels=%s)",
+                                    len(onsets), len(offsets), len(pred_syl_list)
+                                )
+                                complete_syllables = min(len(onsets), len(offsets), len(pred_syl_list))
+                                onsets = onsets[:complete_syllables]
+                                offsets = offsets[:complete_syllables]
+                                pred_syl_list = pred_syl_list[:complete_syllables]
+                                pred_syl_list_for_playback = pred_syl_list.copy()
+                                class_flag = False
+                                waited_class_time = 0
+                                missing_y_pred_flag = False
+                                offset_pending = False
+                                offset_detected_time = 0
                         
                         # Reset flags for new onset and offset
                         onset_flag = False
@@ -745,16 +756,37 @@ def stream_callback(indata, outdata, frames, time_info, status):
                             # Remove the last onset, offset, and corresponding pred_syl_list entry
                             onsets.pop()
                             offsets.pop()
-                            # syllable list equals offset number
-                            if len_ypred == len_offset:
+                            if class_flag:
+                                # Short syllable is discarded while classification is pending.
+                                # Abort current classification to avoid adding a stale label.
+                                class_flag = False
+                                waited_class_time = 0
+                                offset_pending = False
+                                offset_detected_time = 0
+                                missing_y_pred_flag = False
+                                logger.debug("Discarded short syllable and aborted pending classification")
+                            elif len_ypred == len_offset:
                                 pred_syl_list.pop()
                                 pred_syl_list_for_playback.pop()
-                            # syllable list contains one entry less than offsets (missing syl)
                             elif len_ypred == (len_offset - 1):
-                                missing_y_pred_flag = True
-                                logger.debug("Missing Y_PRED_FLAG set to True")
+                                # No label exists yet for this discarded syllable.
+                                logger.debug("Discarded short syllable had no label to remove")
                             else:
-                                logger.error("Mismatch in lengths!")
+                                logger.warning(
+                                    "Mismatch detected during short-syllable discard; resyncing state "
+                                    "(onsets=%s offsets=%s labels=%s)",
+                                    len(onsets), len(offsets), len(pred_syl_list)
+                                )
+                                complete_syllables = min(len(onsets), len(offsets), len(pred_syl_list))
+                                onsets = onsets[:complete_syllables]
+                                offsets = offsets[:complete_syllables]
+                                pred_syl_list = pred_syl_list[:complete_syllables]
+                                pred_syl_list_for_playback = pred_syl_list.copy()
+                                class_flag = False
+                                waited_class_time = 0
+                                missing_y_pred_flag = False
+                                offset_pending = False
+                                offset_detected_time = 0
                         onset_flag = False
                         offset_pending = False
                         offset_detected_time = 0
@@ -856,16 +888,37 @@ def stream_callback(indata, outdata, frames, time_info, status):
                                 # Remove the last onset, offset, and corresponding pred_syl_list entry
                                 onsets.pop()
                                 offsets.pop()
-                                # syllable list equals offset number
-                                if len_ypred == len_offset:
+                                if class_flag:
+                                    # Short syllable is discarded while classification is pending.
+                                    # Abort current classification to avoid adding a stale label.
+                                    class_flag = False
+                                    waited_class_time = 0
+                                    offset_pending = False
+                                    offset_detected_time = 0
+                                    missing_y_pred_flag = False
+                                    logger.debug("Discarded short syllable and aborted pending classification")
+                                elif len_ypred == len_offset:
                                     pred_syl_list.pop()
                                     pred_syl_list_for_playback.pop()
-                                # syllable list contains one entry less than offsets (missing syl)
                                 elif len_ypred == (len_offset - 1):
-                                    missing_y_pred_flag = True
-                                    logger.debug("Missing Y_PRED_FLAG set to True")
+                                    # No label exists yet for this discarded syllable.
+                                    logger.debug("Discarded short syllable had no label to remove")
                                 else:
-                                    logger.error("Mismatch in lengths!")
+                                    logger.warning(
+                                        "Mismatch detected during short-syllable discard; resyncing state "
+                                        "(onsets=%s offsets=%s labels=%s)",
+                                        len(onsets), len(offsets), len(pred_syl_list)
+                                    )
+                                    complete_syllables = min(len(onsets), len(offsets), len(pred_syl_list))
+                                    onsets = onsets[:complete_syllables]
+                                    offsets = offsets[:complete_syllables]
+                                    pred_syl_list = pred_syl_list[:complete_syllables]
+                                    pred_syl_list_for_playback = pred_syl_list.copy()
+                                    class_flag = False
+                                    waited_class_time = 0
+                                    missing_y_pred_flag = False
+                                    offset_pending = False
+                                    offset_detected_time = 0
                             onset_flag = False
                             offset_pending = False
                             offset_detected_time = 0

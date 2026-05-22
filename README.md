@@ -11,77 +11,79 @@ Moove uses a two-stage architecture: a convolutional-based encoder that segments
 
 ## Installation
 
-### With pip (recommended)
+### Quick start (recommended)
 
-To install Moove, use pip (Python 3.9 to including Python 3.12):
+The fastest way to get Moove running. Requires Python 3.10–3.12 and [uv](https://docs.astral.sh/uv/):
+
+```bash
+git clone https://github.com/veitlab/moove.git
+cd moove
+uv sync
+uv run moovegui        # GUI for datasets & training
+uv run moovetaf        # real-time recording & targeting
+```
+
+If you do not have `uv` yet:
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+### With pip
 
 ```bash
 pip install moove
 ```
 
-For a specific version:
+or for a specific version:
 ```bash
-pip install moove==1.0.3
+pip install moove==1.1.0
 ```
 
-After installing, a default configuration file (moove_config.ini) will be available at ~/.moove/. This configuration file should be adjusted to fit your experiment setup.
+After installing, a default configuration file (`moove_config.ini`) will be available at `~/.moove/`. This configuration file should be adjusted to fit your experiment setup.
 
-**Note:** If you encounter issues with the GUI not displaying correctly after installation, try using Python 3.11 with Tkinter installed. On macOS, you may need to install Python 3.11 separately (e.g., via Homebrew) and ensure Tkinter support is available.
-
-### With poetry
-
-Alternatively, poetry can be used for development or as an alternative installation method:
-
-```bash
-poetry install
-```
-
-To run Moove with poetry:
-```bash
-poetry run moovegui
-# or
-poetry run moovetaf
-```
-
-This method is particularly useful if you encounter issues with the pip-installed version, as it runs the code directly from the source directory.
+> **Note for existing users (upgrading from v1.0.x):** Version 1.1.0 includes substantial changes (GUI migration from tkinter to PyQt6, updated dependencies, new test suite). If you need the previous version for compatibility reasons:
+> ```bash
+> pip install moove==1.0.3
+> ```
 
 ### PortAudio Installation
 
 Moove uses the `sounddevice` library, which depends on PortAudio. On most systems, PortAudio is already available or bundled. If needed, follow the steps below to install it:
 
 #### Windows
-PortAudio is typically preinstalled on Windows, so no additional installation is required. If you encounter issues, install the necessary audio drivers or check the PortAudio website: [www.portaudio.com](http://www.portaudio.com).
-
-#### Linux
-Install the PortAudio development library:
-```bash
-# Debian/Ubuntu
-python -m venv venv
-source venv/bin/activate
-sudo apt install python-dev-is-python3 gcc
-sudo apt update && sudo apt install portaudio19-dev
-sudo apt-get install python3-tk
-```
-then install the moove package
+PortAudio is bundled with `sounddevice` on Windows -- no extra installation needed.
 
 #### macOS
-Use Homebrew to install PortAudio:
+Install PortAudio via Homebrew before installing Moove:
 ```bash
 brew install portaudio
 ```
 
-### Enabling ASIO Support for Windows
-
-ASIO provides the lowest latency, which is critical for Moove's real-time targeting capabilities. To enable ASIO support in `sounddevice`, replace the default PortAudio DLL with an ASIO-enabled version.
-
-- Locate the PortAudio DLL in your `sounddevice` installation. A common path is:
-```
-C:\Users\<YourUsername>\AppData\Roaming\Python\<YourPythonVersion>\site-packages\_sounddevice_data\portaudio_binaries\libportaudio64bit.dll
-# oder
-C:\Users\<YourUsername>\AppData\Local\Programs\Python\<YourPythonVersion>\Lib\site-packages\_sounddevice_data\portaudio_binaries\libportaudio64bit.dll
+#### Linux (Debian / Ubuntu)
+Install the PortAudio development library:
+```bash
+sudo apt update
+sudo apt install python3-dev gcc portaudio19-dev
 ```
 
-- Backup the existing `libportaudio64bit.dll` and replace it with the ASIO-enabled DLL, renaming the `libportaudio64bit-asio.dll` to `libportaudio64bit.dll`.
+### Enabling ASIO Support (Windows)
+
+ASIO provides the lowest latency, which is critical for Moove's real-time targeting capabilities.
+
+**Modern method** (sounddevice >= 0.5): set the environment variable before starting Moove:
+```powershell
+$env:SD_ENABLE_ASIO = "1"
+moovegui
+```
+
+**Legacy method**: replace the default PortAudio DLL manually:
+- Locate `libportaudio64bit.dll` in your `sounddevice` installation's `_sounddevice_data/portaudio-binaries/` folder
+- If `libportaudio64bit-ASIO.dll` exists alongside it: delete the non-ASIO DLL and rename the ASIO version
+- If only the non-ASIO DLL exists: download the ASIO-enabled binary from https://github.com/spatialaudio/portaudio-binaries and replace the existing file
 
 ## Configuration
 
@@ -105,80 +107,58 @@ export MOOVE_CONFIG_DIR="/path/to/config"
 moovegui
 ```
 
-**Benefits:** Enables different drives, network storage, project isolation, and multi-user setups.
-
 ## Usage
 
-Once installed, Moove offers two main entry points for operation:
+Once installed, Moove offers two main entry points:
 
 - `moovegui`: Opens the GUI for creating labeled datasets and training the segmentation and classification networks.
-
 - `moovetaf`: Starts the recording and targeting application, enabling real-time targeting of specific syllables.
 
-To start, simply type `moovegui` or `moovetaf` in the terminal.
-
-**Alternative:** If you installed Moove using poetry, you can run it with:
+To start, simply type `moovegui` or `moovetaf` in the terminal. When using uv:
 ```bash
-poetry run moovegui
-# or
-poetry run moovetaf
+uv run moovegui
+uv run moovetaf
 ```
 
 ### Requirements
 
-- Python Version: Python 3.9 to including Python 3.12
-- Numpy Version: Numpy < 2.0
-- Torch Version: Torch < 2.6
-- Audio Hardware: A microphone and speaker setup is required for online targeting experiments.
+- Python 3.10 -- 3.12 (3.11 recommended)
+- Audio hardware: a microphone and speaker setup is required for online targeting experiments
 
 ### Troubleshooting
 
-**GUI not displaying correctly after pip install:**
+**PortAudio / sounddevice errors:**
 
-If the GUI window opens but appears empty (no plots visible), try the following:
+Ensure PortAudio is installed on your system (see Installation above). On Linux: `sudo apt install portaudio19-dev`. On macOS: `brew install portaudio`.
 
-1. **Use Python 3.11 with Tkinter:** Install Python 3.11 separately and ensure Tkinter support is available:
-   ```bash
-   # macOS (using Homebrew)
-   brew install python@3.11
-   python3.11 -m pip install moove
-   python3.11 -m moovegui
-   ```
+**GUI not starting:**
 
-2. **Use Poetry instead:** Poetry often resolves environment issues:
-   ```bash
-   poetry install
-   poetry run moovegui
-   ```
+Make sure you have a display server available. On headless Linux systems, PyQt6 requires an X11 or Wayland session.
 
-3. **Check Tkinter installation:** Verify that Tkinter is properly installed:
-   ```bash
-   python3 -c "import tkinter; print('Tkinter is available')"
-   ```
+**NumPy compatibility:**
+
+Moove works with both NumPy 1.x and 2.x. If you encounter unexpected errors with NumPy 2.x, try `pip install "numpy<2"`.
 
 ### Workflow Overview
 
-This section outlines the typical workflow for setting up Moove and conducting experiments:
+1. **Baseline Recordings** -- Begin with baseline recordings using MooveTaf. In the configuration file, set `realtime_classification` to `False` and configure `dB_threshold` for bout detection.
 
-1.  Baseline Recordings
-Begin with baseline recordings using MooveTaf to capture the bird's songs without targeting. In the configuration file (moove_config.ini), set `realtime_classification` to False for these recordings. Additionally, set `dB_threshold` for bout detection to define when a sequence starts and ends.
+2. **Manual Segmentation** -- In MooveGUI, use the Resegmentation Window to manually segment recorded songs.
 
-2.  Manual Segmentation
-In the MooveGUI, use the "ResegmentationWindow" to manually segment recorded songs and adjust the segmentation points as needed.
+3. **Train the Segmentation Network** -- With the segmentation data, open the Training Window to train the segmentation network. Then return to the Resegmentation Window for automated re-segmentation.
 
-3.  Train the Segmentation Network
-With the segmentation data, open the "TrainingWindow" to train the segmentation network. Once the network is trained, return to the "ResegmentationWindow" to perform an automated re-segmentation on all data, ensuring consistency with segmentation results that would occur in real time.
+4. **Label Creation** -- Use the Cluster Window in the GUI to label syllable segments. Clusters can be automatically labeled and then manually adjusted.
 
-4.  Label Creation
-Use the "ClusterWindow" in the GUI to label syllable segments. The clusters can be automatically labeled and then manually adjusted as needed.
+5. **Train the Classification Network** -- With labeled syllables, use the Training Window to train the classification network.
 
-5.  Train the Classification Network
-With the labeled syllables, use the "TrainingWindow" again to train the classification network based on the assigned labels.
+6. **Real-Time Targeting** -- Update the configuration file with the trained model names, set `realtime_classification` to `True`, and specify the target syllable. MooveTaf is now ready for real-time targeting experiments.
 
-6.  Real-Time Targeting Setup
-Finally, update the configuration file with the names of the trained segmentation and classification networks, set `realtime_classification` to True, and specify the target syllable for feedback. MooveTaf can now be used for conducting real-time targeting experiments, enabling precise, low-latency feedback during song production.
-
-A detailed guide on how to use Moove can be downloaded directly from the repository.
+A detailed guide is available in the `docs/` folder and can be built with Sphinx:
+```bash
+cd docs
+sphinx-build -b html source build/html
+open build/html/index.html
+```
 
 ## Contact
 

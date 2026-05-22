@@ -10,3 +10,7 @@ __pycache__/
 venv/
 .venv/
 .idea/
+.DS_Store
+docs/build/
+docs/guide_raw.rst
+docs/_static/

@@ -1,16 +1,18 @@
-File created: {{ file_created }} 
- 
-    begin rec = {{ begin_rec }} ms 
-    trig time  = {{ trig_time }} ms 
-    rec end = {{ rec_end }} ms 
- 
-ADFREQ = {{ adfreq }} 
-Chans = {{ chans }} 
-Samples = {{ samples }} 
-Catch Song = {{ catch_song }} 
-T Before = {{ t_before }} 
-T After = {{ t_after }} 
-Feedback information: 
-{% block content %}{% for info in feedback_info %}
-{{ info[0] }} msec: {{ info[1] }}{% endfor %}
-{% endblock %}
+File created: {{ file_created }}
+
+    begin rec = {{ begin_rec }} ms
+    trig time  = {{ trig_time }} ms
+    rec end = {{ rec_end }} ms
+
+ADFREQ = {{ adfreq }}
+Chans = {{ chans }}
+Samples = {{ samples }}
+Catch Song = {{ catch_song }}
+Hand Segmented = {{ hand_segmented }}
+Hand Classified = {{ hand_classified }}
+T Before = {{ t_before }}
+T After = {{ t_after }}
+Feedback information:
+{% for info in feedback_info %}
+{{ info[0] }} msec: {{ info[1] }}
+{%- endfor %}
