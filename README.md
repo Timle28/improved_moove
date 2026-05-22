@@ -153,7 +153,7 @@ Moove works with both NumPy 1.x and 2.x. If you encounter unexpected errors with
 
 6. **Real-Time Targeting** -- Update the configuration file with the trained model names, set `realtime_classification` to `True`, and specify the target syllable. MooveTaf is now ready for real-time targeting experiments.
 
-A detailed guide is available in the `docs/` folder and can be built with Sphinx:
+A detailed guide is available at **https://veitlab.github.io/moove** or can be built locally:
 ```bash
 cd docs
 sphinx-build -b html source build/html
