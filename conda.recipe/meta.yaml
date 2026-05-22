@@ -1,5 +1,5 @@
 {% set name = "moove" %}
-{% set version = "1.0.3" %}
+{% set version = "1.1.0.post1" %}
 
 package:
   name: {{ name|lower }}
@@ -7,7 +7,7 @@ package:
 
 source:
   url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
-  sha256: 531bcd905ea4df696a0e0919937a1e4f7569df225ba61cea573c519d6ffd0547
+  sha256: 29800776fed4bb3b12c338c4beb5473c4f826244ccc0d0c2e77d0e55b896e21a
   # For local testing, replace with:
   # path: ..
 
