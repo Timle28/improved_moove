@@ -304,23 +304,29 @@ def extract_raw_audio(full_audio_data, chunk_size):
 
 def play_sound(display_dict, ax1):
     '''Plays the sound of the displayed data.'''
+    import logging
+    log = logging.getLogger("moove")
     if sd is None:
+        log.error("Playback unavailable: sounddevice (sd) failed to import.")
         return
 
     x_start, x_end = ax1.get_xlim()
-
-    x1_border = int(x_start * display_dict["sampling_rate"])
-    x2_border = int(x_end * display_dict["sampling_rate"])
+    sr = display_dict["sampling_rate"]
+    x1_border = max(0, int(x_start * sr))
+    x2_border = int(x_end * sr)
 
     sound = display_dict["song_data"][x1_border:x2_border]
-    sampling_rate = display_dict["sampling_rate"]
+    if len(sound) == 0:
+        log.warning("Playback: empty selection (%.3f-%.3f s); nothing to play.", x_start, x_end)
+        return
+    log.info("Playback: %d samples (%.3f-%.3f s) at %d Hz.", len(sound), x_start, x_end, sr)
 
     def play():
         try:
-            sd.play(sound, samplerate=sampling_rate)
+            sd.play(sound, samplerate=sr)
             sd.wait()
-        except Exception:
-            return
+        except Exception as exc:
+            log.error("Playback failed in sd.play: %s", exc, exc_info=True)
 
     play_sound_thread = threading.Thread(target=play)
     play_sound_thread.start()

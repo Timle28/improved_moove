@@ -154,6 +154,9 @@ class TestSwipe:
     def test_swipe_right_shifts_x(self, gui_window):
         _reset_file_0(gui_window)
         s = gui_window.app_state
+        # Zoom in first so there is room to swipe: the view clamps to the
+        # recording extent, so swiping at full zoom is correctly a no-op.
+        zoom(s); zoom(s); zoom(s)
         x0_before, x1_before = s.ax1.get_xlim()
 
         swipe_right(s)
@@ -165,6 +168,7 @@ class TestSwipe:
     def test_swipe_left_shifts_x(self, gui_window):
         _reset_file_0(gui_window)
         s = gui_window.app_state
+        zoom(s); zoom(s); zoom(s)
         x0_before, x1_before = s.ax1.get_xlim()
 
         swipe_left(s)

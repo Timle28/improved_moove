@@ -57,6 +57,8 @@ class AppState:
         self.server_thread = None
         self.stop_event = threading.Event()
         self.spec = None
+        self.spec_full_data = None
+        self.spec_low_data = None
         self.canvas = None
         self.ax1 = None
         self.ax2 = None
@@ -69,6 +71,9 @@ class AppState:
         self.moved_point = None
         self.new_onset = None
         self.selected_syllable_index = None
+        # Segmentation undo/redo history (per loaded file).
+        self.seg_history = []
+        self.seg_history_index = -1
         self.data_dir = ""
         self.current_file_index = 0
         self.last_file_delta = 0
@@ -263,28 +268,16 @@ class AppState:
 
     def draw_canvas(self):
         if self.canvas:
-            self.canvas.draw()
-            self._update_ax2_background()
-
-    def _update_ax2_background(self):
-        """Recapture ax2 background without text for consistent blitting."""
-        if not self.ax2 or not self.canvas:
-            return
-        renderer = self.canvas.get_renderer()
-        texts = self.ax2.texts[:]
-        for t in texts:
-            t.set_visible(False)
-        self.ax2.draw(renderer)
-        self.ax2_background = self.canvas.copy_from_bbox(self.ax2.bbox)
-        for t in texts:
-            t.set_visible(True)
-        self.ax2.draw(renderer)
-        # Don't blit here to avoid coordinate synchronization issues in PyQt
+            # draw_idle() is non-blocking and coalesces a burst of redraws into a
+            # single render, which keeps zoom/pan/slider interaction responsive.
+            # (The old _update_ax2_background recapture was removed: the cached
+            # ax2_background was never restored anywhere, so it was pure overhead
+            # on every draw.)
+            self.canvas.draw_idle()
 
     def redraw_spectrogram(self, vmin, vmax):
-        if self.spec:
-            self.spec.set_clim(vmin, vmax)
-            self.draw_canvas()
+        if self.canvas is not None and hasattr(self.canvas, 'set_levels'):
+            self.canvas.set_levels(vmin, vmax)
 
     def set_axes(self, ax1, ax2, ax3):
         self.ax1 = ax1

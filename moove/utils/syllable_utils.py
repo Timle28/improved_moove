@@ -3,6 +3,99 @@ import numpy as np
 import os
 from matplotlib.patches import Rectangle
 
+_SEG_HISTORY_LIMIT = 200
+
+
+def _seg_snapshot(display_dict):
+    """Copy the current segmentation (onsets/offsets/labels) for the history."""
+    return {
+        'onsets': np.array(display_dict.get('onsets', []), copy=True),
+        'offsets': np.array(display_dict.get('offsets', []), copy=True),
+        'labels': str(display_dict.get('labels', '')),
+    }
+
+
+def init_seg_history(app_state):
+    """Start a fresh undo/redo history for the currently loaded file."""
+    dd = app_state.display_dict
+    if dd is None or 'onsets' not in dd:
+        app_state.seg_history = []
+        app_state.seg_history_index = -1
+        return
+    app_state.seg_history = [_seg_snapshot(dd)]
+    app_state.seg_history_index = 0
+
+
+def record_seg_state(app_state):
+    """Push the current segmentation onto the history (call after each edit)."""
+    dd = app_state.display_dict
+    if dd is None:
+        return
+    if app_state.seg_history_index < 0:
+        init_seg_history(app_state)
+        return
+    # Drop any redo branch, then append the new state.
+    history = app_state.seg_history[:app_state.seg_history_index + 1]
+    history.append(_seg_snapshot(dd))
+    if len(history) > _SEG_HISTORY_LIMIT:
+        history = history[-_SEG_HISTORY_LIMIT:]
+    app_state.seg_history = history
+    app_state.seg_history_index = len(history) - 1
+
+
+def _apply_seg_snapshot(app_state, snap):
+    from moove.utils.plot_utils import update_ax2_ax3
+    from moove.utils import save_notmat
+
+    dd = app_state.display_dict
+    if dd is None:
+        return
+    dd['onsets'] = np.array(snap['onsets'], copy=True)
+    dd['offsets'] = np.array(snap['offsets'], copy=True)
+    dd['labels'] = snap['labels']
+    # Selection may now point past the end; clear it to stay safe.
+    app_state.selected_syllable_index = None
+    save_notmat(os.path.join(app_state.data_dir, f"{dd['file_name']}.not.mat"), dd)
+    update_ax2_ax3(app_state.ax2, app_state.ax3, dd, app_state)
+
+
+def undo_segmentation(app_state):
+    """Revert to the previous segmentation state (Ctrl/Cmd+Z)."""
+    if app_state.seg_history_index <= 0:
+        app_state.logger.debug("Undo: nothing to undo.")
+        return
+    app_state.seg_history_index -= 1
+    _apply_seg_snapshot(app_state, app_state.seg_history[app_state.seg_history_index])
+    app_state.logger.debug("Undo -> history index %d", app_state.seg_history_index)
+
+
+def redo_segmentation(app_state):
+    """Re-apply the next segmentation state (Ctrl/Cmd+Shift+Z)."""
+    if app_state.seg_history_index >= len(app_state.seg_history) - 1:
+        app_state.logger.debug("Redo: nothing to redo.")
+        return
+    app_state.seg_history_index += 1
+    _apply_seg_snapshot(app_state, app_state.seg_history[app_state.seg_history_index])
+    app_state.logger.debug("Redo -> history index %d", app_state.seg_history_index)
+
+
+def set_threshold_from_click(event, app_state):
+    """Double-click on the amplitude plot to set the segmentation threshold."""
+    from moove.utils.plot_utils import update_ax2_ax3
+
+    if not getattr(event, 'dblclick', False):
+        return
+    if event.inaxes is not app_state.ax3 or event.ydata is None:
+        return
+    value = round(float(event.ydata), 1)
+    try:
+        app_state.evfuncs_params['threshold'].set(str(value))
+    except (KeyError, AttributeError):
+        return
+    if app_state.display_dict is not None:
+        update_ax2_ax3(app_state.ax2, app_state.ax3, app_state.display_dict, app_state)
+    app_state.logger.info("Threshold set to %.1f dB via double-click.", value)
+
 
 def add_new_segment(event, app_state):
     """Add a new segment based on user input from a mouse event."""
@@ -43,6 +136,7 @@ def add_new_segment(event, app_state):
 
         app_state.new_onset = None
         save_notmat(os.path.join(app_state.data_dir, f"{display_dict['file_name']}.not.mat"), display_dict)
+        record_seg_state(app_state)
         update_ax2_ax3(app_state.ax2, app_state.ax3, display_dict, app_state)
 
     else:
@@ -50,13 +144,29 @@ def add_new_segment(event, app_state):
             app_state.new_onset = None
 
 
+def _label_index_at(app_state, x_sec):
+    """Index of the syllable whose [onset, offset] spans x_sec, else nearest."""
+    dd = app_state.display_dict
+    if dd is None:
+        return None
+    on = np.asarray(dd.get("onsets", []), dtype=float) / 1000.0
+    off = np.asarray(dd.get("offsets", []), dtype=float) / 1000.0
+    n = min(len(on), len(off))
+    if n == 0:
+        return None
+    for i in range(n):
+        if on[i] <= x_sec <= off[i]:
+            return i
+    centers = (on[:n] + off[:n]) / 2.0
+    return int(np.argmin(np.abs(centers - x_sec)))
+
+
 def select_event(event, app_state):
     """Handle syllable selection based on event type."""
     if app_state.edit_type == "Label Interactive" and event.inaxes == app_state.ax2:
-        for i, text in enumerate(app_state.ax2.texts):
-            if text.get_window_extent().contains(event.x, event.y):
-                highlight_syllable(i, app_state)
-                break
+        idx = _label_index_at(app_state, event.xdata)
+        if idx is not None:
+            highlight_syllable(idx, app_state)
     elif app_state.edit_type == "New Segment":
         add_new_segment(event, app_state)
     elif app_state.edit_type == "Delete Segment":
@@ -66,42 +176,23 @@ def select_event(event, app_state):
 
 
 def _redraw_ax2_labels(app_state):
-    """Fast redraw for ax2 labels without restoring cached backgrounds."""
-    if app_state.ax2 is None or app_state.canvas is None:
-        return
-
-    ax2 = app_state.ax2
-
-    # Temporary white overlay to cover old glyph pixels before redrawing labels.
-    wipe = Rectangle(
-        (0.0, 0.0), 1.0, 1.0,
-        transform=ax2.transAxes,
-        facecolor='white',
-        edgecolor='none',
-        zorder=0,
-        clip_on=False,
-    )
-    ax2.draw_artist(wipe)
-
-    for text in ax2.texts:
-        ax2.draw_artist(text)
-
-    app_state.canvas.blit(ax2.bbox)
+    """Label color/text changes auto-render with pyqtgraph; nothing to do."""
+    return
 
 
 def highlight_syllable(idx, app_state):
-    """Highlight the selected syllable."""
-    if idx < 0 or idx >= len(app_state.ax2.texts):
+    """Highlight the selected syllable label in red."""
+    canvas = app_state.canvas
+    n = canvas.label_count()
+    if idx < 0 or idx >= n:
         return
 
     prev_idx = app_state.selected_syllable_index
-    if prev_idx is not None and 0 <= prev_idx < len(app_state.ax2.texts):
-        app_state.ax2.texts[prev_idx].set_color('black')
- 
-    app_state.selected_syllable_index = idx
-    app_state.ax2.texts[idx].set_color('red')
+    if prev_idx is not None and 0 <= prev_idx < n:
+        canvas.set_label_color(prev_idx, '#000000')
 
-    _redraw_ax2_labels(app_state)
+    app_state.selected_syllable_index = idx
+    canvas.set_label_color(idx, '#d62728')
 
 
 def edit_syllable(event, app_state):
@@ -133,13 +224,14 @@ def edit_syllable(event, app_state):
         labels[app_state.selected_syllable_index] = event.key
         display_dict["labels"] = ''.join(labels)
 
-        # Update only the changed text artist to keep interaction responsive.
-        app_state.ax2.texts[app_state.selected_syllable_index].set_text(event.key)
+        # Update only the changed label item to keep interaction responsive.
+        app_state.canvas.set_label_text(app_state.selected_syllable_index, event.key)
 
         save_notmat(
             os.path.join(app_state.data_dir, f"{display_dict['file_name']}.not.mat"),
             display_dict
         )
+        record_seg_state(app_state)
         next_idx = (app_state.selected_syllable_index + 1) % num_labels
         highlight_syllable(next_idx, app_state)
 
@@ -169,6 +261,7 @@ def delete_segment(event, app_state):
             display_dict["labels"], display_dict["onsets"], display_dict["offsets"] = ''.join(labels), onsets, offsets
 
             save_notmat(os.path.join(app_state.data_dir, f"{display_dict['file_name']}.not.mat"), display_dict)
+            record_seg_state(app_state)
             update_ax2_ax3(app_state.ax2, app_state.ax3, display_dict, app_state)
             break
 
@@ -210,7 +303,7 @@ def move_segment(event, app_state):
             if closest_marker is not None:
                 app_state.moved_point = (marker_type, marker_index)
                 marker_height = float(app_state.evfuncs_params['threshold'].get())
-                mark_selected_marker(app_state.ax3, closest_marker, marker_height)
+                app_state.canvas.mark_selected(closest_marker, marker_height)
 
     else:
         if event.inaxes == app_state.ax3 and event.button == 3:  # Right-click
@@ -231,6 +324,7 @@ def move_segment(event, app_state):
             display_dict["onsets"], display_dict["offsets"] = onsets, offsets
             app_state.moved_point = None
             save_notmat(os.path.join(app_state.data_dir, f"{display_dict['file_name']}.not.mat"), display_dict)
+            record_seg_state(app_state)
             update_ax2_ax3(app_state.ax2, app_state.ax3, display_dict, app_state)
         else:
             app_state.moved_point = None
@@ -257,14 +351,42 @@ def valid_move(new_x, marker_index, onsets, offsets, is_onset):
 
 
 def mark_selected_marker(ax3, time, marker_height):
-    """Highlight the selected marker in the plot."""
-    ax3.plot(time, marker_height, marker='+', color='red', markersize=10, markeredgewidth=1.5)
-    ax3.figure.canvas.draw()
+    """Deprecated: selection markers are drawn via canvas.mark_selected()."""
+    return
+
+
+def _undo_redo_action(key):
+    """Map a matplotlib key string to 'undo'/'redo', or None.
+
+    Accepts Ctrl and Cmd (super) so it works on macOS and elsewhere:
+    Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z and Ctrl/Cmd+Y = redo.
+    """
+    if not key:
+        return None
+    parts = key.split('+')
+    base = parts[-1]
+    mods = set(parts[:-1])
+    has_cmd = bool(mods & {'ctrl', 'control', 'cmd', 'super'})
+    if not has_cmd:
+        return None
+    if base == 'z':
+        return 'redo' if 'shift' in mods else 'undo'
+    if base == 'y':
+        return 'redo'
+    return None
 
 
 def handle_keypress(event, app_state, v):
     """Handle keypress events to set edit types and update the selection bar."""
     app_state.logger.debug("Key pressed: %s", event.key)
+
+    action = _undo_redo_action(event.key)
+    if action == 'undo':
+        undo_segmentation(app_state)
+        return
+    if action == 'redo':
+        redo_segmentation(app_state)
+        return
 
     # shortcuts
     edit_type = app_state.edit_type
@@ -273,9 +395,8 @@ def handle_keypress(event, app_state, v):
         v.set("1")
         if app_state.selected_syllable_index is not None:
             idx = app_state.selected_syllable_index
-            app_state.ax2.texts[idx].set_color('black')
+            app_state.canvas.set_label_color(idx, '#000000')
             app_state.selected_syllable_index = None
-            _redraw_ax2_labels(app_state)
     elif edit_type != "Label Interactive":
         if event.key == 'm':
             edit_type = "Move Segment"

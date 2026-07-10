@@ -16,9 +16,6 @@ from pathlib import Path
 import torch
 
 import matplotlib as mpl
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.widgets import RectangleSelector
 from PIL import Image
 
 from PyQt6.QtWidgets import (
@@ -30,13 +27,14 @@ from PyQt6.QtCore import Qt, QRect, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QPalette
 
 from moove.qt_helpers import QRangeSliderV, RadioAdapter, set_combo_items, invoke_in_main_thread, show_info
+from moove.pg_canvas import MoovePgCanvas
 from moove.utils import (
     get_display_data, get_directories, read_batch, get_file_data_by_index,
     save_seg_class_recfile, plot_data, select_event, edit_syllable,
     handle_keypress, zoom, unzoom, swipe_left, swipe_right, handle_playback,
     handle_delete, handle_crop, open_resegment_window, update,
     open_cluster_window, open_training_window, open_relabel_window, find_batch_files,
-    create_batch_file, unzoom_small
+    create_batch_file, unzoom_small, set_threshold_from_click
 )
 from moove.models.ConvMLP import ConvMLP
 from moove.models.CNN import CNN
@@ -357,20 +355,16 @@ class MooveMainWindow(QMainWindow):
 
         parent_layout.addLayout(bar)
 
-    # Plot area (matplotlib canvas + range slider)
+    # Plot area (pyqtgraph canvas + range slider)
     def _build_plot_area(self, parent_layout):
         s = self.app_state
         plot_row = QHBoxLayout()
 
-        self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(
-            3, 1, figsize=(9, 5.5),
-            gridspec_kw={'height_ratios': [6, 1, 6]}, sharex=True)
-
-        self.canvas = FigureCanvasQTAgg(self.fig)
+        self.canvas = MoovePgCanvas(s)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        s.set_axes(self.ax1, self.ax2, self.ax3)
         s.set_canvas(self.canvas)
+        self.ax1, self.ax2, self.ax3 = self.canvas.ax1, self.canvas.ax2, self.canvas.ax3
+        s.ax1, s.ax2, s.ax3 = self.ax1, self.ax2, self.ax3
         if s.song_files:
             try:
                 s.display_dict = get_display_data(
@@ -381,7 +375,6 @@ class MooveMainWindow(QMainWindow):
                 s.display_dict = None
         else:
             s.display_dict = None
-        s.ax3_background = s.canvas.copy_from_bbox(s.ax3.bbox)
 
         plot_row.addWidget(self.canvas, stretch=1)
 
@@ -401,16 +394,6 @@ class MooveMainWindow(QMainWindow):
         plot_row.addWidget(self.range_slider)
 
         parent_layout.addLayout(plot_row, stretch=1)
-
-        # Rectangle selectors
-        self.rect_sel_ax1 = RectangleSelector(
-            self.ax1, self._on_rect_select, useblit=True, button=[1],
-            minspanx=30, minspany=30, spancoords='pixels', interactive=False,
-            state_modifier_keys={"rotate": ""})
-        self.rect_sel_ax3 = RectangleSelector(
-            self.ax3, self._on_rect_select, useblit=True, button=[1],
-            minspanx=30, minspany=30, spancoords='pixels', interactive=False,
-            state_modifier_keys={"rotate": ""})
 
     # ------------------------------------------------------------------
     # Button bar
@@ -476,11 +459,9 @@ class MooveMainWindow(QMainWindow):
     # Canvas events
     # ------------------------------------------------------------------
     def _connect_canvas_events(self):
-        s = self.app_state
-        self.canvas.mpl_connect('key_press_event',
-                                lambda ev: handle_keypress(ev, s, self.radio_adapter))
-        self.canvas.mpl_connect('button_press_event', lambda ev: select_event(ev, s))
-        self.canvas.mpl_connect('key_press_event', lambda ev: edit_syllable(ev, s))
+        # Mouse clicks/drags and keyboard are handled inside MoovePgCanvas.
+        # It just needs the radio adapter to drive edit-mode key shortcuts.
+        self.canvas.set_radio_adapter(self.radio_adapter)
 
     # ------------------------------------------------------------------
     # Slots
@@ -560,23 +541,6 @@ class MooveMainWindow(QMainWindow):
         if not saved:
             show_info(self, "Error", f"Could not save status because rec file is missing:\n{rec_path}")
 
-    def _on_rect_select(self, eclick, erelease):
-        if abs(eclick.xdata - erelease.xdata) * 1000 < 5:
-            return
-
-        def _set(axis, ec, er):
-            if ec.ydata > er.ydata:
-                ec.ydata, er.ydata = er.ydata, ec.ydata
-            if ec.xdata > er.xdata:
-                ec.xdata, er.xdata = er.xdata, ec.xdata
-            axis.set_xlim(ec.xdata, er.xdata)
-
-        if eclick.inaxes == self.ax1:
-            _set(self.ax1, eclick, erelease)
-        elif eclick.inaxes == self.ax3:
-            _set(self.ax3, eclick, erelease)
-        self.canvas.draw()
-
     _EDIT_MAP = {1: "None", 2: "New Segment", 3: "Delete Segment",
                  4: "Move Segment", 5: "Label Interactive"}
 
@@ -585,7 +549,6 @@ class MooveMainWindow(QMainWindow):
             return
         value = self._EDIT_MAP.get(btn_id, "None")
         self.app_state.edit_type = value
-        # cursor = Qt.CursorShape.CrossCursor if value != "None" else Qt.CursorShape.ArrowCursor
         cursor = (
             Qt.CursorShape.ArrowCursor
             if value in ("None", "Label Interactive")
@@ -593,15 +556,8 @@ class MooveMainWindow(QMainWindow):
         )
         self.canvas.setCursor(cursor)
         if value == "None" and self.app_state.selected_syllable_index is not None:
-            if len(self.app_state.ax2.texts) <= self.app_state.selected_syllable_index:
-                try:
-                    self.app_state.ax2.texts[self.app_state.selected_syllable_index].set_color('black')
-                except IndexError:
-                    return  # better/other solution than changing 'if' statement
+            self.canvas.set_label_color(self.app_state.selected_syllable_index, '#000000')
             self.app_state.selected_syllable_index = None
-            self.canvas.draw_idle()
-        elif value == 'Label Interactive':
-            self.canvas.draw_idle()
 
     # ------------------------------------------------------------------
     # Helpers

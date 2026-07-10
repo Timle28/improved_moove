@@ -26,6 +26,7 @@ dependencies = [
     "PyQt6>=6.5.0",
     "pillow>=10.0.0",
     "scipy>=1.13.0",
+    "pyqtgraph>=0.14.0",
 ]
 
 [project.urls]
