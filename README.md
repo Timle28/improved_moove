@@ -5,6 +5,14 @@
 
 # Moove
 
+> **Note:** This is an enhanced fork of [veitlab/moove](https://github.com/veitlab/moove).
+> The plot area has been rebuilt on **pyqtgraph** for smooth pan/zoom, plus a
+> customizable-shortcuts settings page, a Segmented/Labeled file filter, faster
+> file switching, and various threshold/audio improvements. See the
+> [Releases](https://github.com/Timle28/improved_moove/releases) for what changed
+> in each version. The segmentation/classification algorithms are unchanged from
+> upstream.
+
 Moove (Marking Online using Only the Onsets of Vocal Elements) is a novel tool for real-time syllable segmentation and classification of birdsong, designed to enable closed-loop experiments in vocal learning research. Designed to study the learned vocalisations of Bengalese finches, Moove identifies target syllables in a bird's song and provides feedback in real time. Moove provides an out-of-the-box, neural network-based approach to reliably target vocal syllables before their end, enabling a reinforcement protocol where a specific syllable can be targeted with aversive white noise or an alternative feedback stimulus if adjusted.
 
 Moove uses a two-stage architecture: a convolutional-based encoder that segments syllables in the audio signal and a CNN classifier that assigns each detected syllable segment a label, identifying its type based on the initial part of its structure. This design allows Moove to operate at a lower audio chunk duration than other tools, enabling faster and more accurate syllable recognition with minimal latency. Moove includes a GUI for creating training datasets using unsupervised methods and training the networks, as well as a recording script for real-time syllable targeting.
@@ -16,11 +24,18 @@ Moove uses a two-stage architecture: a convolutional-based encoder that segments
 The fastest way to get Moove running. Requires Python 3.10–3.12 and [uv](https://docs.astral.sh/uv/):
 
 ```bash
-git clone https://github.com/veitlab/moove.git
-cd moove
+git clone https://github.com/Timle28/improved_moove.git
+cd improved_moove
 uv sync
 uv run moovegui        # GUI for datasets & training
 uv run moovetaf        # real-time recording & targeting
+```
+
+Or install it directly with pip (adds the `moovegui` / `moovetaf` commands):
+
+```bash
+pip install git+https://github.com/Timle28/improved_moove.git
+moovegui
 ```
 
 If you do not have `uv` yet:
