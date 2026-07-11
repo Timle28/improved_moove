@@ -864,3 +864,101 @@ def open_cluster_window(parent, app_state):
     outer.addWidget(dlg.progressbar)
 
     dlg.show()
+
+
+class _KeyCaptureButton(QPushButton):
+    """Button that records the next key press as a shortcut."""
+
+    def __init__(self, action_id, manager, on_changed):
+        super().__init__()
+        self.setAutoDefault(False)
+        self.setDefault(False)
+        self._action_id = action_id
+        self._manager = manager
+        self._on_changed = on_changed
+        self._capturing = False
+        self.setMinimumWidth(150)
+        self.clicked.connect(self._begin_capture)
+        self.refresh()
+
+    def refresh(self):
+        import platform
+        from moove.shortcuts import pretty_key
+        key = self._manager.key_for(self._action_id)
+        self.setText(pretty_key(key, mac=(platform.system() == "Darwin")) if key else "(unset)")
+
+    def _begin_capture(self):
+        self._capturing = True
+        self.setText("Press a key…")
+        self.grabKeyboard()
+
+    def keyPressEvent(self, e):
+        if not self._capturing:
+            super().keyPressEvent(e)
+            return
+        # Ignore lone modifier presses; wait for a real key.
+        if e.key() in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt,
+                       Qt.Key.Key_Meta):
+            return
+        from moove.shortcuts import qt_key_to_string
+        key = qt_key_to_string(e)
+        self._capturing = False
+        self.releaseKeyboard()
+        if key:
+            # Clear any other action already bound to this key (no duplicates).
+            for aid, _, k in self._manager.items():
+                if k == key and aid != self._action_id:
+                    self._manager.set(aid, "")
+            self._manager.set(self._action_id, key)
+            self._manager.save()
+        self._on_changed()
+
+
+def open_shortcuts_window(parent, app_state):
+    """Settings dialog to view and customize keyboard shortcuts."""
+    manager = app_state.shortcuts
+    if manager is None:
+        show_info(parent, "Shortcuts", "Shortcuts are not available.")
+        return
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Keyboard Shortcuts")
+    outer = QVBoxLayout(dlg)
+    outer.addWidget(QLabel("<b>Keyboard shortcuts</b>  (click a key, then press the new key)"))
+
+    grid = QGridLayout()
+    grid.setColumnStretch(0, 1)
+    outer.addLayout(grid)
+
+    buttons = []
+
+    def refresh_all():
+        for b in buttons:
+            b.refresh()
+
+    for row, (aid, label, _key) in enumerate(manager.items()):
+        grid.addWidget(QLabel(label), row, 0)
+        b = _KeyCaptureButton(aid, manager, refresh_all)
+        buttons.append(b)
+        grid.addWidget(b, row, 1)
+
+    outer.addWidget(QLabel(
+        "<i>Tip: labels are typed directly in Label-Interactive mode, so bind file/"
+        "toggle shortcuts to non-letter keys.</i>"))
+
+    row_btns = QHBoxLayout()
+
+    def do_reset():
+        manager.reset()
+        manager.save()
+        refresh_all()
+
+    reset_b = _btn("Reset to defaults", do_reset)
+    close_b = _btn("Close", dlg.accept)
+    row_btns.addStretch()
+    row_btns.addWidget(reset_b)
+    row_btns.addWidget(close_b)
+    outer.addLayout(row_btns)
+
+    dlg.resize(380, 460)
+    dlg.exec()

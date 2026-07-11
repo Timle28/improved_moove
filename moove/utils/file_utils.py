@@ -3,11 +3,43 @@ import evfuncs
 import os
 import re
 import pickle
+import threading
+from collections import OrderedDict
 from scipy.io import wavfile as wav
 from scipy.signal import spectrogram
 
 from moove.qt_helpers import invoke_in_main_thread, show_info
 from moove.utils.audio_utils import decibel
+
+# Cache of the expensive WAV-derived data (spectrogram + smoothed amplitude),
+# keyed by (file_path, mtime). Segmentation (.not.mat) is always read fresh, so
+# edits/resegmentation stay correct. Makes Next/Previous and revisits fast.
+_WAV_CACHE = OrderedDict()
+_WAV_CACHE_MAX = 32
+_WAV_CACHE_LOCK = threading.Lock()
+
+
+def _compute_wav_derived(file_name, file_path, spec_config):
+    if file_name.endswith(".cbin"):
+        song_data, sampling_rate = evfuncs.load_cbin(file_path)
+    elif file_name.endswith(".wav"):
+        sampling_rate, song_data = wav.read(file_path)
+    else:
+        raise ValueError("Unsupported file format")
+
+    smoothed_song_data = evfuncs.smooth_data(song_data, sampling_rate, (500, 10000), 2)
+    freqs, times, spectrogram_data = spectrogram(
+        song_data, fs=sampling_rate,
+        nperseg=spec_config["spec_nperseg"], noverlap=spec_config["spec_noverlap"],
+        nfft=spec_config["spec_nfft"])
+    return {
+        "sampling_rate": sampling_rate,
+        "song_data": song_data,
+        "freqs": freqs,
+        "times": times,
+        "spectrogram_data": spectrogram_data,
+        "amplitude": decibel(smoothed_song_data),
+    }
 
 
 def get_directories(path):
@@ -104,40 +136,65 @@ def get_display_data(file_data_dict, config):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Audio file does not exist: {file_path}")
 
-    if file_name.endswith(".cbin"):
-        song_data, sampling_rate = evfuncs.load_cbin(file_path)
-        if os.path.exists(file_path + ".not.mat"):
-            notmat_dict = evfuncs.load_notmat(file_path + ".not.mat")
-    elif file_name.endswith(".wav"):
-        sampling_rate, song_data = wav.read(file_path)
-        if os.path.exists(file_path + ".not.mat"):
-            notmat_dict = evfuncs.load_notmat(file_path + ".not.mat")
-    else:
-        raise ValueError("Unsupported file format")
+    try:
+        mtime = os.path.getmtime(file_path)
+    except OSError:
+        mtime = 0
+    cache_key = (file_path, mtime)
 
-    smoothed_song_data = evfuncs.smooth_data(song_data, sampling_rate, (500, 10000), 2)
-    freqs, times, spectrogram_data = spectrogram(song_data,
-                                                 fs=sampling_rate,
-                                                 nperseg=spectrogram_config["spec_nperseg"],
-                                                 noverlap=spectrogram_config["spec_noverlap"],
-                                                 nfft=spectrogram_config["spec_nfft"]
-    )
-    amplitude = decibel(smoothed_song_data)
+    with _WAV_CACHE_LOCK:
+        base = _WAV_CACHE.get(cache_key)
+        if base is not None:
+            _WAV_CACHE.move_to_end(cache_key)
 
-    display_dict = {
-        "file_name": file_name,
-        "sampling_rate": sampling_rate,
-        "song_data": song_data,
-        "freqs": freqs,
-        "times": times,
-        "spectrogram_data": spectrogram_data,
-        "amplitude": amplitude,
-    }
+    if base is None:
+        base = _compute_wav_derived(file_name, file_path, spectrogram_config)
+        with _WAV_CACHE_LOCK:
+            _WAV_CACHE[cache_key] = base
+            while len(_WAV_CACHE) > _WAV_CACHE_MAX:
+                _WAV_CACHE.popitem(last=False)
 
+    # Shallow copy so per-file edits (onsets/offsets/labels) never mutate the
+    # cached WAV arrays.
+    display_dict = dict(base)
+    display_dict["file_name"] = file_name
+
+    if os.path.exists(file_path + ".not.mat"):
+        notmat_dict = evfuncs.load_notmat(file_path + ".not.mat")
     if notmat_dict:
         display_dict.update(notmat_dict)
 
     return display_dict
+
+
+def prefetch_wav_data(file_paths, config=None):
+    """Warm the WAV cache for the given files in a background thread (so the
+    next Next/Previous is instant). Cheap no-op for already-cached files."""
+    dspec = {"spec_nperseg": 1024, "spec_noverlap": 896, "spec_nfft": 1024}
+    spec_config = {**dspec, **config} if config else dspec
+
+    def _work():
+        for fp in file_paths:
+            if not fp or not os.path.exists(fp):
+                continue
+            try:
+                mtime = os.path.getmtime(fp)
+            except OSError:
+                mtime = 0
+            key = (fp, mtime)
+            with _WAV_CACHE_LOCK:
+                if key in _WAV_CACHE:
+                    continue
+            try:
+                data = _compute_wav_derived(os.path.basename(fp), fp, spec_config)
+            except Exception:
+                continue
+            with _WAV_CACHE_LOCK:
+                _WAV_CACHE[key] = data
+                while len(_WAV_CACHE) > _WAV_CACHE_MAX:
+                    _WAV_CACHE.popitem(last=False)
+
+    threading.Thread(target=_work, name="PrefetchWavThread", daemon=True).start()
 
 
 def save_seg_class_recfile(filepath, segmented, classified):

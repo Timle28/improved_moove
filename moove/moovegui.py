@@ -21,7 +21,7 @@ from PIL import Image
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QPushButton, QCheckBox, QRadioButton, QButtonGroup,
-    QMessageBox, QSizePolicy
+    QMessageBox, QSizePolicy, QLabel
 )
 from PyQt6.QtCore import Qt, QRect, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QPalette
@@ -34,7 +34,8 @@ from moove.utils import (
     handle_keypress, zoom, unzoom, swipe_left, swipe_right, handle_playback,
     handle_delete, handle_crop, open_resegment_window, update,
     open_cluster_window, open_training_window, open_relabel_window, find_batch_files,
-    create_batch_file, unzoom_small, set_threshold_from_click
+    create_batch_file, unzoom_small, set_threshold_from_click, open_shortcuts_window,
+    filter_segmented_files, filter_classified_files
 )
 from moove.models.ConvMLP import ConvMLP
 from moove.models.CNN import CNN
@@ -121,6 +122,9 @@ class MooveMainWindow(QMainWindow):
         self.app_state = AppState(_global_dir)
         self.app_state.load_state()
         self._apply_config()
+
+        from moove.shortcuts import ShortcutManager
+        self.app_state.shortcuts = ShortcutManager(home_config_dir)
 
         # Derive colours from palette
         bg = self.palette().color(QPalette.ColorRole.Window)
@@ -340,6 +344,16 @@ class MooveMainWindow(QMainWindow):
         self.batch_combo.currentTextChanged.connect(self._on_batch_changed)
         bar.addWidget(self.batch_combo)
 
+        # File filter: view all / only segmented / only labeled / both
+        bar.addWidget(QLabel("View:"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.setMinimumWidth(160)
+        for text, mode in [("All files", "all"), ("Segmented", "segmented"),
+                           ("Labeled", "labeled"), ("Segmented + Labeled", "both")]:
+            self.filter_combo.addItem(text, mode)
+        self.filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+        bar.addWidget(self.filter_combo)
+
         bar.addStretch()
 
         # Segmented / Classified checkboxes
@@ -422,6 +436,7 @@ class MooveMainWindow(QMainWindow):
         btn("Relabel", lambda: open_relabel_window(self, s))
         btn("Training", lambda: open_training_window(self, s))
         btn("Cluster", lambda: open_cluster_window(self, s))
+        btn("⌨ Shortcuts", lambda: open_shortcuts_window(self, s))
         bar.addStretch()
 
         parent_layout.addLayout(bar)
@@ -488,15 +503,7 @@ class MooveMainWindow(QMainWindow):
             create_batch_file(s.data_dir)
         s.current_batch_file = "batch.txt"
 
-        s.song_files = read_batch(s.data_dir, s.current_batch_file)
-        set_combo_items(self.file_combo, s.song_files,
-                        s.song_files[s.current_file_index] if s.song_files else None)
-        if s.song_files:
-            plot_data(s)
-        else:
-            for ax in [s.ax1, s.ax2, s.ax3]:
-                ax.clear()
-            s.canvas.draw()
+        self._apply_file_filter()
 
     def _on_file_changed(self):
         self.app_state.selected_syllable_index = None
@@ -506,22 +513,46 @@ class MooveMainWindow(QMainWindow):
             s.current_file_index = s.song_files.index(selected)
             plot_data(s)
 
+    def _on_filter_changed(self):
+        self._apply_file_filter(announce=True)
+
+    def _apply_file_filter(self, announce=False):
+        """Restrict the file list to the current View filter (all / segmented /
+        labeled / both), re-reading the full batch each time so it stays fresh."""
+        s = self.app_state
+        mode = self.filter_combo.currentData() if getattr(self, "filter_combo", None) else "all"
+        full = read_batch(s.data_dir, s.current_batch_file) if (s.data_dir and s.current_batch_file) else []
+
+        if mode == "all" or not full:
+            names = list(full)
+        else:
+            paths = [os.path.join(s.data_dir, n) for n in full]
+            seg = set(filter_segmented_files(paths)) if mode in ("segmented", "both") else set()
+            cla = set(filter_classified_files(paths)) if mode in ("labeled", "both") else set()
+            keep = {"segmented": seg, "labeled": cla, "both": seg & cla}[mode]
+            names = [n for n, p in zip(full, paths) if p in keep]
+
+        prev = self.file_combo.currentText()
+        s.song_files = names
+        s.current_file_index = names.index(prev) if prev in names else 0
+        set_combo_items(self.file_combo, names, names[s.current_file_index] if names else "")
+        if names:
+            plot_data(s)
+        else:
+            for ax in (s.ax1, s.ax2, s.ax3):
+                ax.clear()
+            s.canvas.draw()
+            if announce:
+                show_info(self, "Filter", "No files in this batch match the selected filter.")
+
     def _on_batch_changed(self):
         s = self.app_state
         selected = self.batch_combo.currentText()
         if not selected:
             return
         s.current_batch_file = selected
-        s.song_files = read_batch(s.data_dir, selected)
-        s.current_file_index = 0 if s.song_files else None
-        set_combo_items(self.file_combo, s.song_files,
-                        s.song_files[0] if s.song_files else "")
-        if s.song_files:
-            plot_data(s)
-        else:
-            for ax in [s.ax1, s.ax2, s.ax3]:
-                ax.clear()
-            s.canvas.draw()
+        s.current_file_index = 0
+        self._apply_file_filter()
 
     def _on_slider_changed(self, vmin, vmax):
         s = self.app_state

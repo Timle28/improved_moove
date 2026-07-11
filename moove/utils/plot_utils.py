@@ -164,7 +164,20 @@ def plot_data(app_state):
         app_state.reset_edit_type_gui()
 
         app_state.draw_canvas()
-        
+
+        # Warm the cache for the neighbouring files so Next/Previous is instant.
+        try:
+            from moove.utils.file_utils import prefetch_wav_data
+            idx = app_state.current_file_index
+            neighbours = []
+            for j in (idx - 1, idx + 1, idx + 2):
+                if app_state.song_files and 0 <= j < len(app_state.song_files):
+                    neighbours.append(os.path.join(app_state.data_dir, app_state.song_files[j]))
+            if neighbours:
+                prefetch_wav_data(neighbours, app_state.config)
+        except Exception as prefetch_error:
+            app_state.logger.debug("Prefetch skipped: %s", prefetch_error)
+
     except Exception as exc:
         # Log the REAL error so it is visible in the console / log file.
         app_state.logger.error("plot_data failed: %s", exc)

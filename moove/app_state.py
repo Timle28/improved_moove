@@ -93,6 +93,7 @@ class AppState:
         self.day_combobox = None
         self.segmented_checkbox = None
         self.classified_checkbox = None
+        self.shortcuts = None
         self.reset_edit_type_gui = None
         self.config = {
             'global_dir': global_dir,

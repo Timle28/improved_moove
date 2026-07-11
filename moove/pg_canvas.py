@@ -24,7 +24,7 @@ import matplotlib.cm as cm
 import pyqtgraph as pg
 from pyqtgraph import Point
 from pyqtgraph.Qt import QtCore
-from PyQt6.QtCore import Qt, QEvent
+from PyQt6.QtCore import Qt, QEvent, QTimer
 from PyQt6.QtGui import QNativeGestureEvent
 from PyQt6.QtWidgets import QApplication
 
@@ -41,23 +41,45 @@ _HOVER_COLOR = "#000000"
 
 _SCROLL_ZOOM = 1.1          # zoom factor per wheel/pinch notch (gentle)
 _WHEEL_PAN_FRAC = 0.2       # Shift+wheel pan, fraction of view width per notch
+_OVERSCROLL = 0.10          # how far past the data you can push (rubber-band)
+
+
+def _clamp_range(lo, hi, bounds):
+    """Fit [lo, hi] inside *bounds*, preserving width when possible."""
+    if bounds is None:
+        return lo, hi
+    bmin, bmax = (bounds[0], bounds[1]) if bounds[0] <= bounds[1] else (bounds[1], bounds[0])
+    width = hi - lo
+    if width >= bmax - bmin:
+        return bmin, bmax
+    if lo < bmin:
+        return bmin, bmin + width
+    if hi > bmax:
+        return bmax - width, bmax
+    return lo, hi
 
 
 class _AxisAdapter:
     """matplotlib-style get/set xlim/ylim over pyqtgraph ViewBoxes.
 
     X always goes through the shared master viewbox so the three (x-linked)
-    plots stay bit-identical in x; Y uses each plot's own viewbox."""
+    plots stay bit-identical in x; Y uses each plot's own viewbox. Button-driven
+    navigation (zoom/unzoom/swipe) goes through set_xlim/set_ylim and is clamped
+    hard to the data -- only trackpad/wheel gestures rubber-band past the edge."""
 
-    def __init__(self, xvb, yvb):
+    def __init__(self, xvb, yvb, app_state=None, y_key=None):
         self.xvb = xvb
         self.yvb = yvb
+        self.app_state = app_state
+        self.y_key = y_key   # 'ax1' | 'ax3' | None -> which original y-range to clamp to
 
     def get_xlim(self):
         (x0, x1), _ = self.xvb.viewRange()
         return x0, x1
 
     def set_xlim(self, x0, x1):
+        bounds = getattr(self.app_state, "original_x_range", None) if self.app_state else None
+        x0, x1 = _clamp_range(x0, x1, bounds)
         self.xvb.setXRange(x0, x1, padding=0)
 
     def get_ylim(self):
@@ -65,6 +87,9 @@ class _AxisAdapter:
         return y0, y1
 
     def set_ylim(self, y0, y1):
+        bounds = getattr(self.app_state, "original_y_range_" + self.y_key, None) \
+            if (self.app_state and self.y_key) else None
+        y0, y1 = _clamp_range(y0, y1, bounds)
         self.yvb.setYRange(y0, y1, padding=0)
 
     # no-ops so matplotlib-era call sites keep working
@@ -101,6 +126,68 @@ class _EditViewBox(pg.ViewBox):
             ev.accept()
         else:
             ev.ignore()
+
+
+class _Bouncer:
+    """Rubber-band overscroll: after zoom/pan settles, if the view sits past the
+    data bounds (in the overscroll margin / white space), animate it springing
+    back to the data with an ease-out curve."""
+
+    _STEPS = 12            # animation frames
+    _SETTLE_MS = 90        # idle time after last range change before bouncing
+
+    def __init__(self, canvas):
+        self.canvas = canvas
+        self._bouncing = False
+        self._settle = QTimer(canvas)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(self._SETTLE_MS)
+        self._settle.timeout.connect(self._bounce_back)
+        self._anim = QTimer(canvas)
+        self._anim.setInterval(16)
+        self._anim.timeout.connect(self._step)
+        self._t = 0.0
+        canvas.vb_spec.sigRangeChanged.connect(self._on_changed)
+        canvas.vb_amp.sigRangeChanged.connect(self._on_changed)
+
+    def _on_changed(self, *args):
+        if self._bouncing:
+            return
+        self._settle.start()
+
+    def _bounce_back(self):
+        s = self.canvas.app_state
+        if s.original_x_range is None:
+            return
+        (x0, x1), (sy0, sy1) = self.canvas.vb_spec.viewRange()
+        _, (ay0, ay1) = self.canvas.vb_amp.viewRange()
+        tx0, tx1 = _clamp_range(x0, x1, s.original_x_range)
+        ty0, ty1 = _clamp_range(sy0, sy1, s.original_y_range_ax1)
+        tay0, tay1 = _clamp_range(ay0, ay1, s.original_y_range_ax3)
+        eps = 1e-9
+        if (abs(tx0 - x0) < eps and abs(tx1 - x1) < eps and
+                abs(ty0 - sy0) < eps and abs(ty1 - sy1) < eps and
+                abs(tay0 - ay0) < eps and abs(tay1 - ay1) < eps):
+            return
+        self._start = (x0, x1, sy0, sy1, ay0, ay1)
+        self._target = (tx0, tx1, ty0, ty1, tay0, tay1)
+        self._t = 0.0
+        self._bouncing = True
+        self._anim.start()
+
+    def _step(self):
+        self._t += 1.0 / self._STEPS
+        done = self._t >= 1.0
+        e = 1.0 if done else 1.0 - (1.0 - self._t) ** 3   # ease-out cubic
+        x0, x1, sy0, sy1, ay0, ay1 = self._start
+        tx0, tx1, ty0, ty1, tay0, tay1 = self._target
+        lp = lambda a, b: a + (b - a) * e
+        self.canvas.vb_spec.setRange(xRange=(lp(x0, tx0), lp(x1, tx1)),
+                                     yRange=(lp(sy0, ty0), lp(sy1, ty1)), padding=0)
+        self.canvas.vb_amp.setYRange(lp(ay0, tay0), lp(ay1, tay1), padding=0)
+        if done:
+            self._anim.stop()
+            self._bouncing = False
 
 
 class MoovePgCanvas(pg.GraphicsLayoutWidget):
@@ -190,9 +277,11 @@ class MoovePgCanvas(pg.GraphicsLayoutWidget):
         self.scene().sigMouseClicked.connect(self._on_scene_click)
 
         self.label_items = []
-        self.ax1 = _AxisAdapter(self.vb_spec, self.vb_spec)
-        self.ax2 = _AxisAdapter(self.vb_spec, self.vb_lbl)
-        self.ax3 = _AxisAdapter(self.vb_spec, self.vb_amp)
+        self.ax1 = _AxisAdapter(self.vb_spec, self.vb_spec, app_state, "ax1")
+        self.ax2 = _AxisAdapter(self.vb_spec, self.vb_lbl, app_state, None)
+        self.ax3 = _AxisAdapter(self.vb_spec, self.vb_amp, app_state, "ax3")
+
+        self._bouncer = _Bouncer(self)
 
     # ------------------------------------------------------------------
     # Rendering
@@ -228,9 +317,14 @@ class MoovePgCanvas(pg.GraphicsLayoutWidget):
 
         self.title.setText(str(display_dict.get("file_name", "")), color="k", size="24pt")
 
-        # axis ranges + clamp limits
-        self.vb_spec.setLimits(xMin=t0, xMax=t1, yMin=f0, yMax=f1)
-        self.vb_amp.setLimits(xMin=t0, xMax=t1, yMin=amin, yMax=amax)
+        # Allow a margin of overscroll past the data on every side (white space);
+        # the bouncer springs the view back to the data when interaction stops.
+        m = _OVERSCROLL
+        mx = m * (t1 - t0)
+        self.vb_spec.setLimits(xMin=t0 - mx, xMax=t1 + mx,
+                               yMin=f0 - m * (f1 - f0), yMax=f1 + m * (f1 - f0))
+        self.vb_amp.setLimits(xMin=t0 - mx, xMax=t1 + mx,
+                              yMin=amin - m * (amax - amin), yMax=amax + m * (amax - amin))
         self.vb_spec.setRange(xRange=(t0, t1), yRange=(f0, f1), padding=0)
         self.vb_amp.setYRange(amin, amax, padding=0.02)
 
@@ -453,49 +547,86 @@ class MoovePgCanvas(pg.GraphicsLayoutWidget):
     # ------------------------------------------------------------------
     # Keyboard -> app handlers (mode shortcuts, undo/redo, label editing)
     # ------------------------------------------------------------------
+    # Shortcuts that stay active even while typing labels in Label-Interactive.
+    _LABEL_SAFE = ("play", "undo", "redo", "edit_none")
+
     def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Space:          # space -> play current view
-            from moove.utils.movefuncs_utils import handle_playback
-            handle_playback(self.app_state)
-            e.accept()
-            return
-        key = self._mpl_key(e)
+        from moove.shortcuts import qt_key_to_string
+        s = self.app_state
+        key = qt_key_to_string(e)
         if key is None:
             super().keyPressEvent(e)
             return
-        from moove.utils.syllable_utils import handle_keypress, edit_syllable
-        adapter = _KeyEvent(key)
-        handle_keypress(adapter, self.app_state, self._radio_adapter)
-        edit_syllable(adapter, self.app_state)
-        e.accept()
+        sm = getattr(s, "shortcuts", None)
+        action = sm.action_for(key) if sm else None
+        label_mode = (s.edit_type == "Label Interactive")
 
-    _SPECIAL_KEYS = None
+        # Some shortcuts fire in any mode (play/undo/redo/cancel).
+        if action in self._LABEL_SAFE and self._dispatch(action):
+            e.accept()
+            return
 
-    def _mpl_key(self, e):
-        if MoovePgCanvas._SPECIAL_KEYS is None:
-            MoovePgCanvas._SPECIAL_KEYS = {
-                Qt.Key.Key_Left: "left", Qt.Key.Key_Right: "right",
-                Qt.Key.Key_Up: "up", Qt.Key.Key_Down: "down",
-                Qt.Key.Key_Escape: "escape", Qt.Key.Key_Backspace: "backspace",
-                Qt.Key.Key_Delete: "delete", Qt.Key.Key_Return: "enter",
-                Qt.Key.Key_Enter: "enter",
-            }
-        base = self._SPECIAL_KEYS.get(e.key())
-        if base is None:
-            txt = e.text()
-            if txt and txt.isprintable() and txt.strip():
-                base = txt.lower()
-        if base is None:
-            return None
-        mods = []
-        m = e.modifiers()
-        if m & Qt.KeyboardModifier.ControlModifier:   # Cmd on macOS / Ctrl on Win
-            mods.append("ctrl")
-        if m & Qt.KeyboardModifier.AltModifier:
-            mods.append("alt")
-        if m & Qt.KeyboardModifier.ShiftModifier:
-            mods.append("shift")
-        return "+".join(mods + [base])
+        if label_mode:
+            # Dedicate the keyboard to labeling / syllable navigation.
+            from moove.utils.syllable_utils import edit_syllable
+            edit_syllable(_KeyEvent(key), s)
+            e.accept()
+            return
+
+        if action and self._dispatch(action):
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+    _EDIT_MODES = {
+        "edit_none": ("None", "1"), "edit_new": ("New Segment", "2"),
+        "edit_delete": ("Delete Segment", "3"), "edit_move": ("Move Segment", "4"),
+        "edit_label": ("Label Interactive", "5"),
+    }
+
+    def _dispatch(self, action):
+        """Run a shortcut action. Returns True if handled."""
+        s = self.app_state
+        if action == "previous_file":
+            from moove.utils import plot_data
+            s.change_file(-1)
+            plot_data(s)
+            return True
+        if action == "next_file":
+            from moove.utils import plot_data
+            s.change_file(1)
+            plot_data(s)
+            return True
+        if action == "play":
+            from moove.utils.movefuncs_utils import handle_playback
+            handle_playback(s)
+            return True
+        if action == "undo":
+            from moove.utils.syllable_utils import undo_segmentation
+            undo_segmentation(s)
+            return True
+        if action == "redo":
+            from moove.utils.syllable_utils import redo_segmentation
+            redo_segmentation(s)
+            return True
+        if action == "toggle_segmented":
+            if s.segmented_checkbox is not None:
+                s.segmented_checkbox.toggle()
+            return True
+        if action == "toggle_classified":
+            if s.classified_checkbox is not None:
+                s.classified_checkbox.toggle()
+            return True
+        if action in self._EDIT_MODES:
+            mode, radio_val = self._EDIT_MODES[action]
+            if mode == "None" and s.selected_syllable_index is not None:
+                self.set_label_color(s.selected_syllable_index, "#000000")
+                s.selected_syllable_index = None
+            s.edit_type = mode
+            if self._radio_adapter is not None:
+                self._radio_adapter.set(radio_val)
+            return True
+        return False
 
     @staticmethod
     def _scroll_factor(steps):

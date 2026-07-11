@@ -312,8 +312,24 @@ def play_sound(display_dict, ax1):
 
     x_start, x_end = ax1.get_xlim()
     sr = display_dict["sampling_rate"]
+    n_total = len(display_dict["song_data"])
+    dur_total = n_total / sr
+
+    # When zoomed in tight, the visible window can be only a few ms -- too short
+    # to hear. Extend to a minimum audible duration, centered on the view and
+    # clamped to the file.
+    MIN_PLAY_SEC = 0.25
+    if (x_end - x_start) < MIN_PLAY_SEC:
+        center = (x_start + x_end) / 2.0
+        x_start = center - MIN_PLAY_SEC / 2.0
+        x_end = center + MIN_PLAY_SEC / 2.0
+        if x_start < 0:
+            x_start, x_end = 0.0, min(dur_total, MIN_PLAY_SEC)
+        elif x_end > dur_total:
+            x_start, x_end = max(0.0, dur_total - MIN_PLAY_SEC), dur_total
+
     x1_border = max(0, int(x_start * sr))
-    x2_border = int(x_end * sr)
+    x2_border = min(n_total, int(x_end * sr))
 
     sound = display_dict["song_data"][x1_border:x2_border]
     if len(sound) == 0:
@@ -323,7 +339,41 @@ def play_sound(display_dict, ax1):
 
     def play():
         try:
-            sd.play(sound, samplerate=sr)
+            # Follow the current default output (e.g. a Bluetooth speaker
+            # connected after app start): refresh PortAudio's cached device list.
+            # We do NOT pass an explicit device index -- resolving it by hand was
+            # unreliable and could route to the wrong device (garbled audio); the
+            # refreshed default is correct.
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception as exc:
+                log.debug("PortAudio refresh skipped: %s", exc)
+            try:
+                log.info("Playback output device: %s", sd.query_devices(kind="output")["name"])
+            except Exception:
+                pass
+
+            # Convert to float32 in [-1, 1] -- the most reliable format across
+            # devices -- as a copy so the cached WAV data is never mutated.
+            snd = np.asarray(sound, dtype=np.float32)
+            if np.issubdtype(np.asarray(sound).dtype, np.integer):
+                snd = snd / float(np.iinfo(np.asarray(sound).dtype).max)
+            else:
+                snd = snd.copy()
+
+            # Short fade in/out to avoid clicks/pops at the cut boundaries.
+            ramp = min(int(0.005 * sr), snd.shape[0] // 2)
+            if ramp > 0:
+                fin = np.linspace(0.0, 1.0, ramp, dtype=np.float32)
+                if snd.ndim == 1:
+                    snd[:ramp] *= fin
+                    snd[-ramp:] *= fin[::-1]
+                else:
+                    snd[:ramp] *= fin[:, None]
+                    snd[-ramp:] *= fin[::-1][:, None]
+
+            sd.play(snd, samplerate=sr)
             sd.wait()
         except Exception as exc:
             log.error("Playback failed in sd.play: %s", exc, exc_info=True)
